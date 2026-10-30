@@ -1,0 +1,195 @@
+// ZeroLink Zero-Copy Binary Serialization Schema
+// Namespace: ZeroLink.Protocol
+
+namespace ZeroLink.Protocol;
+
+enum ClipboardFormat : byte {
+    PlainText = 0,
+    HtmlText = 1,
+    PngImage = 2,
+    UriList = 3
+}
+
+enum NotificationActionType : byte {
+    Dismiss = 0,
+    Open = 1,
+    QuickReply = 2
+}
+
+enum ScreenAction : byte {
+    Start = 0,
+    Stop = 1,
+    RequestKeyframe = 2,
+    SetBitrate = 3
+}
+
+enum TouchAction : byte {
+    Down = 0,
+    Move = 1,
+    Up = 2,
+    Cancel = 3
+}
+
+table HandshakeInit {
+    client_ephemeral_pubkey: [ubyte]; // 32 bytes X25519 public key
+    salt: [ubyte];                    // 32 bytes HKDF salt
+    protocol_version: uint32;
+    client_device_name: string;
+}
+
+table HandshakeReply {
+    server_ephemeral_pubkey: [ubyte]; // 32 bytes X25519 public key
+    auth_tag: [ubyte];                // 16 bytes GCM authentication tag
+    server_device_name: string;
+    l2cap_psm: uint16;
+}
+
+table NotificationActionItem {
+    action_index: uint32;
+    title: string;
+    is_reply: bool;
+}
+
+table NotificationEvent {
+    notification_id: string;
+    package_name: string;
+    app_name: string;
+    title: string;
+    content: string;
+    sub_text: string;
+    timestamp: uint64;
+    actions: [NotificationActionItem];
+    icon_png_or_webp: [ubyte];
+    is_ongoing: bool;
+    category: string;
+}
+
+table NotificationCancel {
+    notification_id: string;
+    package_name: string;
+}
+
+table NotificationActionExecute {
+    notification_id: string;
+    package_name: string;
+    action_index: uint32;
+    reply_text: string;
+}
+
+table ClipboardPayload {
+    format: ClipboardFormat;
+    data: [ubyte];
+    payload_hash: uint64;
+    timestamp: uint64;
+}
+
+table FileMetadata {
+    file_id: string;
+    relative_path: string;
+    file_size: uint64;
+    modified_timestamp: uint64;
+    mime_type: string;
+    is_directory: bool;
+    thumbnail_webp: [ubyte];
+}
+
+table FileCatalog {
+    sync_root_id: string;
+    files: [FileMetadata];
+    total_count: uint32;
+}
+
+table FileFetchRequest {
+    file_id: string;
+    byte_offset: uint64;
+    byte_length: uint32;
+    transfer_ticket: string;
+}
+
+table FileFetchChunk {
+    file_id: string;
+    byte_offset: uint64;
+    data: [ubyte];
+    is_eof: bool;
+}
+
+table WifiWakeRequest {
+    target_ip: string;
+    port: uint16;
+    session_token: string;
+    reason: string; // e.g., "FILE_FETCH", "SCREEN_CAST"
+}
+
+table WifiWakeResponse {
+    ready: bool;
+    ip_address: string;
+    port: uint16;
+    quic_alpn: string;
+}
+
+table ScreenControlRequest {
+    action: ScreenAction;
+    width: uint32;
+    height: uint32;
+    max_fps: uint32;
+    bitrate_bps: uint32;
+    hevc_profile: uint32;
+}
+
+table ScreenTouchInput {
+    pointer_id: int32;
+    action: TouchAction;
+    x: float32;
+    y: float32;
+    pressure: float32;
+}
+
+table ScreenKeyInput {
+    keycode: int32;
+    meta_state: int32;
+    is_down: bool;
+}
+
+table VideoFrameHeader {
+    sequence_number: uint64;
+    pts_microseconds: uint64;
+    is_keyframe: bool;
+    nal_unit_count: uint16;
+    frame_size_bytes: uint32;
+}
+
+table Heartbeat {
+    battery_percentage: uint8;
+    is_charging: bool;
+    wifi_connected: bool;
+    quic_port_active: uint16;
+    device_power_mode: uint8; // 0: Normal, 1: LowPower, 2: DozeMode
+}
+
+union MessageBody {
+    HandshakeInit,
+    HandshakeReply,
+    NotificationEvent,
+    NotificationCancel,
+    NotificationActionExecute,
+    ClipboardPayload,
+    FileCatalog,
+    FileFetchRequest,
+    FileFetchChunk,
+    WifiWakeRequest,
+    WifiWakeResponse,
+    ScreenControlRequest,
+    ScreenTouchInput,
+    ScreenKeyInput,
+    VideoFrameHeader,
+    Heartbeat
+}
+
+table Envelope {
+    version: uint16;
+    sequence: uint64;
+    timestamp_ms: uint64;
+    body: MessageBody;
+}
+
+root_type Envelope;

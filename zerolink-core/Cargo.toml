@@ -1,0 +1,19 @@
+[package]
+name = "zerolink-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["ZeroLink Authors"]
+description = "Core cryptographic, framing, and dual-radio state machine primitives for ZeroLink"
+
+[dependencies]
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.12"
+sha2 = { version = "0.10", default-features = false }
+crc32fast = "1.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+byteorder = "1.5"
+thiserror = "1.0"
+
+[dev-dependencies]
+rand = "0.8"

@@ -1,0 +1,13 @@
+[package]
+name = "zerolink-jni"
+version = "0.1.0"
+edition = "2021"
+authors = ["ZeroLink Authors"]
+description = "Native Rust JNI bindings for Android ZeroLink Service"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zerolink-core = { path = "../../zerolink-core" }
+jni = { version = "0.21", default-features = false }
