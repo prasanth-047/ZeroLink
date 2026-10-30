@@ -17,5 +17,7 @@ local.properties
 .idea/
 .vscode/
 *.iml
+.project
+.classpath
 .DS_Store
 Thumbs.db

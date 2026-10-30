@@ -239,7 +239,7 @@ impl NotificationPayload {
         let is_ongoing = buf[8] != 0;
         let mut offset = 9;
 
-        let mut read_str = |offset: &mut usize| -> Result<String> {
+        let read_str = |offset: &mut usize| -> Result<String> {
             if buf.len() < *offset + 2 {
                 return Err(ZeroLinkError::IncompleteFrame {
                     needed: *offset + 2,
@@ -316,7 +316,7 @@ impl WifiWakePayload {
         let port = BigEndian::read_u16(&buf[0..2]);
         let mut offset = 2;
 
-        let mut read_str = |offset: &mut usize| -> Result<String> {
+        let read_str = |offset: &mut usize| -> Result<String> {
             if buf.len() < *offset + 2 {
                 return Err(ZeroLinkError::IncompleteFrame {
                     needed: *offset + 2,
@@ -396,7 +396,7 @@ impl FileMetadata {
         let is_directory = buf[16] != 0;
         let mut offset = 17;
 
-        let mut read_str = |offset: &mut usize| -> Result<String> {
+        let read_str = |offset: &mut usize| -> Result<String> {
             if buf.len() < *offset + 2 {
                 return Err(ZeroLinkError::IncompleteFrame {
                     needed: *offset + 2,
@@ -549,7 +549,7 @@ impl FileFetchRequest {
         let byte_length = BigEndian::read_u32(&buf[8..12]);
         let mut offset = 12;
 
-        let mut read_str = |offset: &mut usize| -> Result<String> {
+        let read_str = |offset: &mut usize| -> Result<String> {
             if buf.len() < *offset + 2 {
                 return Err(ZeroLinkError::IncompleteFrame {
                     needed: *offset + 2,

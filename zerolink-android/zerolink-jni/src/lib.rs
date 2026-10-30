@@ -11,7 +11,7 @@ static SESSION_CIPHER: Mutex<Option<SessionCipher>> = Mutex::new(None);
 
 #[no_mangle]
 pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_generateServerEphemeralKey(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
 ) -> jbyteArray {
     let kx = KeyExchange::new();
@@ -31,7 +31,7 @@ pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_generateServerEpheme
 
 #[no_mangle]
 pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_completeHandshake(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     client_pub_bytes: JByteArray,
     salt_bytes: JByteArray,
@@ -78,7 +78,7 @@ pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_completeHandshake(
 
 #[no_mangle]
 pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_encryptAndFramePacket(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     packet_type_val: jint,
     plaintext_data: JByteArray,
@@ -121,7 +121,7 @@ pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_encryptAndFramePacke
 
 #[no_mangle]
 pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_decryptFramedPacket(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     framed_data: JByteArray,
 ) -> jbyteArray {
@@ -216,7 +216,7 @@ pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_serializeNotificatio
 
 #[no_mangle]
 pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_serializeClipboard(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     format_val: jint,
     payload_hash: jlong,

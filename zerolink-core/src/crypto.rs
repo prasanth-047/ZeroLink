@@ -1,6 +1,6 @@
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
+    Aes256Gcm,
 };
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
@@ -91,15 +91,14 @@ impl SessionCipher {
 
     /// Derives a deterministic 12-byte nonce for a specific 64-bit sequence counter.
     /// Nonce = IV_Base ^ SequenceNumber (little-endian padded).
-    fn derive_nonce(&self, seq: u64) -> Nonce {
+    fn derive_nonce(&self, seq: u64) -> aes_gcm::Nonce<aes_gcm::aead::consts::U12> {
         let mut nonce_bytes = self.iv_base;
         let seq_bytes = seq.to_le_bytes();
         for (i, b) in seq_bytes.iter().enumerate() {
             nonce_bytes[i] ^= b;
         }
-        *Nonce::from_slice(&nonce_bytes)
+        *aes_gcm::Nonce::<aes_gcm::aead::consts::U12>::from_slice(&nonce_bytes)
     }
-
     /// Encrypts plaintext payload in-place or returns ciphertext with appended GCM tag.
     /// Increments monotonic TX counter.
     pub fn encrypt(&mut self, plaintext: &[u8], associated_data: &[u8]) -> Result<(u64, Vec<u8>)> {

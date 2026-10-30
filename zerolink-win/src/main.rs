@@ -16,10 +16,9 @@ use ble_client::BleL2capClient;
 use clipboard::ClipboardManager;
 use cloud_filter::CloudFilterVirtualDrive;
 use notifications::WindowsToastManager;
-use quic_client::EphemeralBulkClient;
 use screen_viewer::ScreenMirrorReceiver;
 use zerolink_core::framing::PacketType;
-use zerolink_core::protocol::{ClipboardPayload, NotificationPayload, WifiWakePayload};
+use zerolink_core::protocol::{ClipboardPayload, WifiWakePayload};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Win32 Clipboard Listener registered on HWND_MESSAGE");
 
     // 2. Initialize Native WinRT Toast Notification Manager (No Electron / No WebView)
-    let toast_manager = Arc::new(WindowsToastManager::new("ZeroLink.DesktopClient"));
+    let _toast_manager = Arc::new(WindowsToastManager::new("ZeroLink.DesktopClient"));
     tracing::info!("Native Windows.UI.Notifications manager initialized");
 
     // 3. Initialize Cloud Filter API (cldapi.dll) Virtual Drive

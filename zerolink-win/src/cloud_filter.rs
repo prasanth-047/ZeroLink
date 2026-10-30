@@ -50,7 +50,8 @@ impl CloudFilterVirtualDrive {
             },
         ];
 
-        let context_ptr = self.wake_tx.as_ref() as *const UnboundedSender<WifiWakePayload> as *const std::ffi::c_void;
+        let context_ptr = self.wake_tx.as_ref() as *const UnboundedSender<WifiWakePayload>
+            as *const std::ffi::c_void;
 
         unsafe {
             // Optional sync root registration for cloud provider identity
@@ -68,11 +69,11 @@ impl CloudFilterVirtualDrive {
             let policies = CF_SYNC_POLICIES {
                 StructSize: std::mem::size_of::<CF_SYNC_POLICIES>() as u32,
                 Hydration: CF_HYDRATION_POLICY {
-                    Primary: CF_HYDRATION_POLICY_PRIMARY_FULL,
+                    Primary: CF_HYDRATION_POLICY_FULL,
                     Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
                 },
                 Population: CF_POPULATION_POLICY {
-                    Primary: CF_POPULATION_POLICY_PRIMARY_ALWAYS_FULL,
+                    Primary: CF_POPULATION_POLICY_FULL,
                     Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
                 },
                 InSync: CF_INSYNC_POLICY_NONE,
@@ -80,18 +81,25 @@ impl CloudFilterVirtualDrive {
                 PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
             };
 
-            let _ = CfRegisterSyncRoot(PCWSTR(path_wide.as_ptr()), &registration, &policies, CF_REGISTER_FLAGS_NONE);
-
-            let hr = CfConnectSyncRoot(
+            let _ = CfRegisterSyncRoot(
                 PCWSTR(path_wide.as_ptr()),
-                callback_table.as_ptr(),
-                context_ptr,
-                CF_CONNECT_FLAGS_REQUIRE_FULL_FILE_PATH,
-                &mut self.connection_key,
+                &registration,
+                &policies,
+                CF_REGISTER_FLAG_NONE,
             );
 
-            if hr.is_err() {
-                return Err(format!("CfConnectSyncRoot failed with hr: {:?}", hr));
+            match CfConnectSyncRoot(
+                PCWSTR(path_wide.as_ptr()),
+                callback_table.as_ptr(),
+                Some(context_ptr),
+                CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
+            ) {
+                Ok(key) => {
+                    self.connection_key = key;
+                }
+                Err(e) => {
+                    return Err(format!("CfConnectSyncRoot failed with error: {:?}", e));
+                }
             }
         }
 
@@ -112,20 +120,18 @@ impl CloudFilterVirtualDrive {
         let name_wide: Vec<u16> = filename.encode_utf16().chain(std::iter::once(0)).collect();
         let id_bytes = file_id.as_bytes();
 
-        let placeholder_info = CF_PLACEHOLDER_CREATE_INFO {
+        let mut placeholder_info = [CF_PLACEHOLDER_CREATE_INFO {
             RelativeFileName: PCWSTR(name_wide.as_ptr()),
             FsMetadata: CF_FS_METADATA {
                 FileSize: file_size_bytes,
                 BasicInfo: windows::Win32::Storage::FileSystem::FILE_BASIC_INFO::default(),
             },
-            SecurityDescriptor: std::ptr::null(),
-            SecurityDescriptorLength: 0,
             FileIdentity: id_bytes.as_ptr() as *const std::ffi::c_void,
             FileIdentityLength: id_bytes.len() as u32,
-            Flags: CF_PLACEHOLDER_CREATE_FLAGS_NONE,
+            Flags: CF_PLACEHOLDER_CREATE_FLAG_NONE,
             Result: windows::core::HRESULT(0),
             CreateUsn: 0,
-        };
+        }];
 
         let path_wide: Vec<u16> = self
             .sync_root_path
@@ -139,9 +145,9 @@ impl CloudFilterVirtualDrive {
             let mut entries_processed = 0u32;
             let hr = CfCreatePlaceholders(
                 PCWSTR(path_wide.as_ptr()),
-                &[placeholder_info],
-                &mut entries_processed,
-                CF_CREATE_FLAGS_NONE,
+                &mut placeholder_info,
+                CF_CREATE_FLAG_NONE,
+                Some(&mut entries_processed),
             );
             if hr.is_err() {
                 return Err(format!("CfCreatePlaceholders failed: {:?}", hr));

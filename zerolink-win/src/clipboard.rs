@@ -100,7 +100,7 @@ impl ClipboardManager {
                         }
                     }
                 }
-                TranslateMessage(&msg);
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
@@ -115,7 +115,7 @@ impl ClipboardManager {
             .store(payload.payload_hash, Ordering::Relaxed);
 
         unsafe {
-            if !OpenClipboard(HWND(std::ptr::null_mut())).as_bool() {
+            if OpenClipboard(HWND(std::ptr::null_mut())).is_err() {
                 return;
             }
 
@@ -159,7 +159,7 @@ unsafe extern "system" fn wnd_proc(
 }
 
 unsafe fn read_clipboard_text(hwnd: HWND) -> Option<String> {
-    if !OpenClipboard(hwnd).as_bool() {
+    if OpenClipboard(hwnd).is_err() {
         return None;
     }
 

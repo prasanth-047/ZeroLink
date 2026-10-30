@@ -43,7 +43,9 @@ impl ScreenMirrorReceiver {
             );
 
             if hr.is_err() {
-                tracing::warn!("Hardware D3D11 device creation failed, falling back to WARP driver");
+                tracing::warn!(
+                    "Hardware D3D11 device creation failed, falling back to WARP driver"
+                );
                 let warp_hr = D3D11CreateDevice(
                     None,
                     D3D_DRIVER_TYPE_WARP,
@@ -86,9 +88,10 @@ impl ScreenMirrorReceiver {
         );
     }
 
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
         self.is_active.store(false, Ordering::SeqCst);
         self.device = None;
         self.context = None;
+        tracing::info!("ScreenMirrorReceiver stopped and D3D11 context released");
     }
 }
