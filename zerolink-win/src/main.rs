@@ -275,14 +275,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = toast_mgr_shared.display_notification(&notif);
                         }
                         UiCommand::TriggerTestClipboard => {
-                            ui_for_events.log("📋 Injecting test text into Windows clipboard");
+                            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                            let test_text = format!("ZeroLink: Hello from Windows PC @ {:02}:{:02}:{:02}", (now_ms / 3600000) % 24, (now_ms / 60000) % 60, (now_ms / 1000) % 60);
+                            ui_for_events.log(&format!("📋 Syncing text to Android: '{}'", test_text));
                             let payload = ClipboardPayload {
                                 format: ClipboardType::PlainText,
                                 payload_hash: 0x12345678,
-                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                                data: b"ZeroLink: Hello from Windows Clipboard!".to_vec(),
+                                timestamp_ms: now_ms,
+                                data: test_text.into_bytes(),
                             };
                             clip_mgr_shared.inject_remote_clipboard(&payload);
+                            let serialized = payload.serialize();
+                            let _ = ble_dispatch.send_packet(PacketType::Clipboard, &serialized, &raw_ble_sender).await;
                         }
                         UiCommand::ToggleScreenMirror => {
                             ui_for_events.log("📱 Screen mirror ready (waiting for Android HEVC video stream)");
@@ -380,11 +384,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 ui_for_events.log(&format!("📁 Received catalog: {} photos/files synced to Virtual Drive", catalog.files.len()));
                                 for file in catalog.files {
-                                    let _ = drive.create_placeholder(
+                                    if let Err(e) = drive.create_placeholder(
                                         &file.relative_path,
                                         file.file_size as i64,
                                         &file.file_id,
-                                    );
+                                    ) {
+                                        tracing::warn!("Failed to create placeholder for {}: {}", file.relative_path, e);
+                                    } else {
+                                        tracing::info!("Created placeholder for '{}' ({} bytes)", file.relative_path, file.file_size);
+                                    }
                                 }
                             } else if let Ok(meta) = FileMetadata::deserialize(&packet.payload) {
                                 tracing::info!("Received single FileMetadata for '{}'", meta.relative_path);
@@ -413,8 +421,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     hb.quic_port_active,
                                     hb.device_power_mode
                                 );
+                                let dev_name = if hb.is_charging { "SM-A075F (Charging)" } else { "SM-A075F" };
                                 ui_for_events.update_device_status(
-                                    if hb.is_charging { "Charging" } else { "Battery" },
+                                    dev_name,
                                     hb.battery_percentage,
                                     true,
                                 );
@@ -422,19 +431,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         PacketType::ScreenCast => {
                             let receiver = screen_rcvr_shared.lock().await;
-                            if packet.payload.len() >= 23 {
+                            let (header_opt, nal_data) = if packet.payload.len() >= 23 {
                                 if let Ok(header) = VideoFrameHeader::deserialize(&packet.payload[..23]) {
-                                    let nal_data = &packet.payload[23..];
-                                    receiver.submit_hevc_packet(
-                                        nal_data,
-                                        header.pts_microseconds,
-                                        header.is_keyframe,
-                                    );
+                                    (Some(header), &packet.payload[23..])
                                 } else {
-                                    receiver.submit_hevc_packet(&packet.payload, 0, false);
+                                    (None, packet.payload.as_slice())
                                 }
                             } else {
-                                receiver.submit_hevc_packet(&packet.payload, 0, false);
+                                (None, packet.payload.as_slice())
+                            };
+                            let (pts, is_kf) = header_opt
+                                .as_ref()
+                                .map(|h| (h.pts_microseconds, h.is_keyframe))
+                                .unwrap_or((0, false));
+                            receiver.submit_hevc_packet(nal_data, pts, is_kf);
+                            let (frames, keyframes, total_bytes) = receiver.stats();
+                            if frames % 30 == 1 || is_kf {
+                                ui_for_events.log(&format!(
+                                    "📱 Screen frame #{}: {} KB (Keyframes: {})",
+                                    frames,
+                                    total_bytes / 1024,
+                                    keyframes
+                                ));
                             }
                         }
                         PacketType::WifiWake => {

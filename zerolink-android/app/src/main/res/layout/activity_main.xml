@@ -172,6 +172,39 @@
             android:textColor="#F1F5F9"
             android:textSize="14sp" />
 
+        <Button
+            android:id="@+id/btn_send_notif"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#334155"
+            android:text="🔔 Send Test Notification to PC"
+            android:textAllCaps="false"
+            android:textColor="#F1F5F9"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_sync_photos"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#334155"
+            android:text="📁 Sync Photos Catalog to PC"
+            android:textAllCaps="false"
+            android:textColor="#F1F5F9"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_screen_mirror"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#334155"
+            android:text="📱 Start Screen Mirroring"
+            android:textAllCaps="false"
+            android:textColor="#F1F5F9"
+            android:textSize="14sp" />
+
         <!-- Activity Log -->
         <TextView
             android:layout_width="wrap_content"

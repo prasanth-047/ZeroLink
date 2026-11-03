@@ -65,7 +65,7 @@
             android:name=".ZeroLinkService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice|mediaProjection" />
 
         <!-- Notification listener service -->
         <service

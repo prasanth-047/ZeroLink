@@ -84,17 +84,40 @@ class ZeroClipboardManager(
         lastLocalHash.set(hash)
         val now = System.currentTimeMillis()
 
-        val serialized = ZeroLinkNative.serializeClipboard(
-            FORMAT_PLAIN_TEXT,
-            hash,
-            now,
-            textBytes
-        ) ?: return
+        val buf = java.nio.ByteBuffer.allocate(21 + textBytes.size).order(java.nio.ByteOrder.BIG_ENDIAN)
+        buf.put(FORMAT_PLAIN_TEXT.toByte())
+        buf.putLong(hash)
+        buf.putLong(now)
+        buf.putInt(textBytes.size)
+        buf.put(textBytes)
 
-        val sent = packetSender(L2capServer.PACKET_TYPE_CLIPBOARD, serialized)
+        val sent = packetSender(L2capServer.PACKET_TYPE_CLIPBOARD, buf.array())
         if (sent) {
             Log.i(TAG, "Local clipboard synced to Windows (hash: ${java.lang.Long.toHexString(hash)}, len: ${textBytes.size})")
         }
+    }
+
+    /**
+     * Manually dispatches clipboard text to Windows without relying on background listener.
+     */
+    fun sendClipboardText(text: String): Boolean {
+        val textBytes = text.toByteArray(Charsets.UTF_8)
+        val hash = computeHash(textBytes)
+        lastLocalHash.set(hash)
+        val now = System.currentTimeMillis()
+
+        val buf = java.nio.ByteBuffer.allocate(21 + textBytes.size).order(java.nio.ByteOrder.BIG_ENDIAN)
+        buf.put(FORMAT_PLAIN_TEXT.toByte())
+        buf.putLong(hash)
+        buf.putLong(now)
+        buf.putInt(textBytes.size)
+        buf.put(textBytes)
+
+        val sent = packetSender(L2capServer.PACKET_TYPE_CLIPBOARD, buf.array())
+        if (sent) {
+            Log.i(TAG, "Manual clipboard synced to Windows: '$text'")
+        }
+        return sent
     }
 
     /**

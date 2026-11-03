@@ -7,6 +7,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -64,6 +65,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnNotificationAccess: Button
     private lateinit var btnBatteryOptimization: Button
     private lateinit var btnTestClipboard: Button
+    private lateinit var btnSendNotif: Button
+    private lateinit var btnSyncPhotos: Button
+    private lateinit var btnScreenMirror: Button
+
+    private var mediaProjectionManager: MediaProjectionManager? = null
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -77,6 +83,26 @@ class MainActivity : AppCompatActivity() {
             appendLog("⚠️ Some permissions were denied: $permissions")
         }
         updateUiState()
+    }
+
+    private val screenCaptureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            val mp = mediaProjectionManager?.getMediaProjection(result.resultCode, result.data!!)
+            if (mp != null) {
+                val dm = resources.displayMetrics
+                val w = if (dm.widthPixels > 0) dm.widthPixels else 720
+                val h = if (dm.heightPixels > 0) dm.heightPixels else 1600
+                val dpi = if (dm.densityDpi > 0) dm.densityDpi else 300
+                ZeroLinkService.instance?.startScreenMirroring(mp, w, h, dpi)
+                updateUiState()
+            } else {
+                appendLog("❌ Failed to obtain MediaProjection handle")
+            }
+        } else {
+            appendLog("⚠️ Screen capture permission was not granted")
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -94,6 +120,11 @@ class MainActivity : AppCompatActivity() {
         btnNotificationAccess = findViewById(R.id.btn_notification_access)
         btnBatteryOptimization = findViewById(R.id.btn_battery_optimization)
         btnTestClipboard = findViewById(R.id.btn_test_clipboard)
+        btnSendNotif = findViewById(R.id.btn_send_notif)
+        btnSyncPhotos = findViewById(R.id.btn_sync_photos)
+        btnScreenMirror = findViewById(R.id.btn_screen_mirror)
+
+        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
         setupListeners()
         updateUiState()
@@ -208,7 +239,63 @@ class MainActivity : AppCompatActivity() {
             val clip = ClipData.newPlainText("ZeroLink", testText)
             cm.setPrimaryClip(clip)
             appendLog("📋 Copied to clipboard: '$testText'")
-            Toast.makeText(this, "Copied to clipboard! Syncing to Windows PC...", Toast.LENGTH_SHORT).show()
+            val s = ZeroLinkService.instance
+            if (s != null) {
+                val ok = s.sendClipboard(testText)
+                if (ok) {
+                    Toast.makeText(this, "Copied and synced to PC!", Toast.LENGTH_SHORT).show()
+                } else {
+                    appendLog("⚠️ Failed to sync clipboard (device not connected)")
+                }
+            } else {
+                appendLog("⚠️ ZeroLinkService is not running")
+            }
+        }
+
+        btnSendNotif.setOnClickListener {
+            val s = ZeroLinkService.instance
+            if (s != null) {
+                val ok = s.sendTestNotification(
+                    "Hello from Galaxy Phone!",
+                    "ZeroLink real-time notification forwarding active."
+                )
+                if (ok) {
+                    Toast.makeText(this, "Notification sent to PC!", Toast.LENGTH_SHORT).show()
+                } else {
+                    appendLog("⚠️ Failed to send notification (device not connected)")
+                }
+            } else {
+                appendLog("⚠️ ZeroLinkService is not running")
+            }
+        }
+
+        btnSyncPhotos.setOnClickListener {
+            val s = ZeroLinkService.instance
+            if (s != null) {
+                val ok = s.sendPhotoCatalog()
+                if (ok) {
+                    Toast.makeText(this, "Photos catalog synced to PC!", Toast.LENGTH_SHORT).show()
+                } else {
+                    appendLog("⚠️ Failed to sync photos (device not connected)")
+                }
+            } else {
+                appendLog("⚠️ ZeroLinkService is not running")
+            }
+        }
+
+        btnScreenMirror.setOnClickListener {
+            val s = ZeroLinkService.instance
+            if (s != null) {
+                if (s.isScreenMirroringActive) {
+                    s.stopScreenMirroring()
+                    updateUiState()
+                } else {
+                    appendLog("Requesting screen capture permission...")
+                    screenCaptureLauncher.launch(mediaProjectionManager!!.createScreenCaptureIntent())
+                }
+            } else {
+                appendLog("⚠️ ZeroLinkService is not running")
+            }
         }
     }
 
@@ -254,6 +341,14 @@ class MainActivity : AppCompatActivity() {
                 tvConnectionStatus.text = "Windows Client: 🟡 Standby (Connecting...)"
                 tvConnectionStatus.setTextColor(0xFFFBBF24.toInt()) // Amber
             }
+
+            if (s?.isScreenMirroringActive == true) {
+                btnScreenMirror.text = "📱 Stop Screen Mirroring"
+                btnScreenMirror.setBackgroundColor(0xFFDC2626.toInt())
+            } else {
+                btnScreenMirror.text = "📱 Start Screen Mirroring"
+                btnScreenMirror.setBackgroundColor(0xFF334155.toInt())
+            }
         } else {
             tvServiceStatus.text = "Service Status: 🔴 Stopped"
             tvServiceStatus.setTextColor(0xFFEF4444.toInt()) // Red
@@ -265,6 +360,9 @@ class MainActivity : AppCompatActivity() {
 
             tvConnectionStatus.text = "Windows Client: Disconnected"
             tvConnectionStatus.setTextColor(0xFF94A3B8.toInt())
+
+            btnScreenMirror.text = "📱 Start Screen Mirroring"
+            btnScreenMirror.setBackgroundColor(0xFF334155.toInt())
         }
 
         val hasPerms = hasRequiredPermissions()

@@ -8,6 +8,7 @@ pub struct CloudFilterVirtualDrive {
     sync_root_path: PathBuf,
     wake_tx: Box<UnboundedSender<WifiWakePayload>>,
     connection_key: CF_CONNECTION_KEY,
+    callback_table: Box<[CF_CALLBACK_REGISTRATION]>,
 }
 
 #[allow(dead_code)]
@@ -17,6 +18,20 @@ impl CloudFilterVirtualDrive {
             sync_root_path,
             wake_tx: Box::new(wake_tx),
             connection_key: CF_CONNECTION_KEY(0),
+            callback_table: Box::new([
+                CF_CALLBACK_REGISTRATION {
+                    Type: CF_CALLBACK_TYPE_FETCH_DATA,
+                    Callback: Some(fetch_data_callback),
+                },
+                CF_CALLBACK_REGISTRATION {
+                    Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
+                    Callback: Some(cancel_fetch_data_callback),
+                },
+                CF_CALLBACK_REGISTRATION {
+                    Type: CF_CALLBACK_TYPE_NONE,
+                    Callback: None,
+                },
+            ]),
         }
     }
 
@@ -35,21 +50,6 @@ impl CloudFilterVirtualDrive {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-
-        let callback_table = [
-            CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_FETCH_DATA,
-                Callback: Some(fetch_data_callback),
-            },
-            CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
-                Callback: Some(cancel_fetch_data_callback),
-            },
-            CF_CALLBACK_REGISTRATION {
-                Type: CF_CALLBACK_TYPE_NONE,
-                Callback: None,
-            },
-        ];
 
         let context_ptr = self.wake_tx.as_ref() as *const UnboundedSender<WifiWakePayload>
             as *const std::ffi::c_void;
@@ -74,7 +74,7 @@ impl CloudFilterVirtualDrive {
                     Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
                 },
                 Population: CF_POPULATION_POLICY {
-                    Primary: CF_POPULATION_POLICY_FULL,
+                    Primary: CF_POPULATION_POLICY_ALWAYS_FULL,
                     Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
                 },
                 InSync: CF_INSYNC_POLICY_NONE,
@@ -86,12 +86,12 @@ impl CloudFilterVirtualDrive {
                 PCWSTR(path_wide.as_ptr()),
                 &registration,
                 &policies,
-                CF_REGISTER_FLAG_NONE,
+                CF_REGISTER_FLAG_UPDATE,
             );
 
             match CfConnectSyncRoot(
                 PCWSTR(path_wide.as_ptr()),
-                callback_table.as_ptr(),
+                self.callback_table.as_ptr(),
                 Some(context_ptr),
                 CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
             ) {
@@ -118,7 +118,16 @@ impl CloudFilterVirtualDrive {
         file_size_bytes: i64,
         file_id: &str,
     ) -> Result<(), String> {
-        let name_wide: Vec<u16> = filename.encode_utf16().chain(std::iter::once(0)).collect();
+        let normalized = filename.replace('/', "\\");
+        let (base_dir, leaf_name) = if let Some(pos) = normalized.rfind('\\') {
+            let parent_dir = self.sync_root_path.join(&normalized[..pos]);
+            let _ = std::fs::create_dir_all(&parent_dir);
+            (parent_dir, &normalized[pos + 1..])
+        } else {
+            (self.sync_root_path.clone(), normalized.as_str())
+        };
+
+        let name_wide: Vec<u16> = leaf_name.encode_utf16().chain(std::iter::once(0)).collect();
         let id_bytes = file_id.as_bytes();
 
         let mut placeholder_info = [CF_PLACEHOLDER_CREATE_INFO {
@@ -129,13 +138,12 @@ impl CloudFilterVirtualDrive {
             },
             FileIdentity: id_bytes.as_ptr() as *const std::ffi::c_void,
             FileIdentityLength: id_bytes.len() as u32,
-            Flags: CF_PLACEHOLDER_CREATE_FLAG_NONE,
+            Flags: CF_PLACEHOLDER_CREATE_FLAG_MARK_IN_SYNC,
             Result: windows::core::HRESULT(0),
             CreateUsn: 0,
         }];
 
-        let path_wide: Vec<u16> = self
-            .sync_root_path
+        let path_wide: Vec<u16> = base_dir
             .as_os_str()
             .to_string_lossy()
             .encode_utf16()
@@ -244,6 +252,29 @@ unsafe extern "system" fn fetch_data_callback(
         };
         let _ = wake_sender.send(wake_req);
     }
+
+    // Acknowledge fetch request so kernel does not stall Explorer / processes
+    let op_info = CF_OPERATION_INFO {
+        StructSize: std::mem::size_of::<CF_OPERATION_INFO>() as u32,
+        Type: CF_OPERATION_TYPE_TRANSFER_DATA,
+        ConnectionKey: info.ConnectionKey,
+        TransferKey: info.TransferKey,
+        RequestKey: info.RequestKey,
+        CorrelationVector: std::ptr::null(),
+        SyncStatus: std::ptr::null(),
+    };
+
+    let chunk_size = (required_length.min(65536) as usize).max(1);
+    let buf = vec![0u8; chunk_size];
+    let mut op_params = CF_OPERATION_PARAMETERS::default();
+    op_params.ParamSize = std::mem::size_of::<CF_OPERATION_PARAMETERS>() as u32;
+    op_params.Anonymous.TransferData.Flags = CF_OPERATION_TRANSFER_DATA_FLAG_NONE;
+    op_params.Anonymous.TransferData.CompletionStatus = windows::Win32::Foundation::NTSTATUS(0);
+    op_params.Anonymous.TransferData.Buffer = buf.as_ptr() as *const std::ffi::c_void;
+    op_params.Anonymous.TransferData.Offset = required_offset;
+    op_params.Anonymous.TransferData.Length = chunk_size as i64;
+
+    let _ = CfExecute(&op_info, &mut op_params);
 }
 
 unsafe extern "system" fn cancel_fetch_data_callback(
