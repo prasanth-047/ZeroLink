@@ -10,6 +10,7 @@ pub struct CloudFilterVirtualDrive {
     connection_key: CF_CONNECTION_KEY,
 }
 
+#[allow(dead_code)]
 impl CloudFilterVirtualDrive {
     pub fn new(sync_root_path: PathBuf, wake_tx: UnboundedSender<WifiWakePayload>) -> Self {
         Self {
@@ -153,6 +154,49 @@ impl CloudFilterVirtualDrive {
                 return Err(format!("CfCreatePlaceholders failed: {:?}", hr));
             }
         }
+        Ok(())
+    }
+
+    /// Returns a reference to the virtual sync root path on disk.
+    pub fn sync_root_path(&self) -> &PathBuf {
+        &self.sync_root_path
+    }
+
+    /// Hydrates a placeholder file with fetched data bytes from the Android device.
+    pub fn hydrate_file_chunk(
+        &self,
+        relative_path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom, Write};
+        let target_path = self.sync_root_path.join(relative_path);
+
+        if let Some(parent) = target_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&target_path)
+            .map_err(|e| format!("Failed to open file for hydration: {}", e))?;
+
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Failed to seek file: {}", e))?;
+
+        file.write_all(data)
+            .map_err(|e| format!("Failed to write chunk data: {}", e))?;
+
+        file.flush()
+            .map_err(|e| format!("Failed to flush hydrated file: {}", e))?;
+
+        tracing::info!(
+            "Hydrated {} bytes for file {:?} at offset {}",
+            data.len(),
+            target_path,
+            offset
+        );
         Ok(())
     }
 

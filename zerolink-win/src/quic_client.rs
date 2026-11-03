@@ -8,6 +8,7 @@ pub struct EphemeralBulkClient {
     remote_addr: Option<SocketAddr>,
 }
 
+#[allow(dead_code)]
 impl EphemeralBulkClient {
     pub fn new() -> Self {
         Self {
@@ -76,6 +77,14 @@ impl EphemeralBulkClient {
             .map_err(|e| ZeroLinkError::ConnectionError(format!("Failed to read chunk payload: {}", e)))?;
 
         Ok(chunk_data)
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
     }
 
     /// Tears down the socket immediately after transfer completes,
