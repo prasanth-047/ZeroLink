@@ -13,6 +13,7 @@ mod cloud_filter;
 mod notifications;
 mod quic_client;
 mod screen_viewer;
+mod ui;
 
 use ble_client::BleL2capClient;
 use clipboard::ClipboardManager;
@@ -20,10 +21,11 @@ use cloud_filter::CloudFilterVirtualDrive;
 use notifications::WindowsToastManager;
 use quic_client::EphemeralBulkClient;
 use screen_viewer::ScreenMirrorReceiver;
+use ui::{spawn_ui_thread, UiCommand};
 use zerolink_core::framing::{Frame, PacketType, HEADER_SIZE};
 use zerolink_core::protocol::{
-    ClipboardPayload, FileCatalog, FileFetchChunk, FileMetadata, Heartbeat, NotificationPayload,
-    VideoFrameHeader, WifiWakePayload,
+    ClipboardPayload, ClipboardType, FileCatalog, FileFetchChunk, FileMetadata, Heartbeat,
+    NotificationPayload, VideoFrameHeader, WifiWakePayload,
 };
 
 #[derive(Debug)]
@@ -64,6 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (raw_ble_tx, mut raw_ble_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (inbound_packet_tx, mut inbound_packet_rx) = mpsc::unbounded_channel::<InboundPacket>();
     let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel::<(u64, u16, String)>();
+    let (ui_cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
     // 1. Start Win32 Clipboard Listener (WM_CLIPBOARDUPDATE, 0.0% Idle CPU)
     let clip_manager = Arc::new(ClipboardManager::new(clip_tx));
@@ -95,7 +99,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let screen_receiver = Arc::new(tokio::sync::Mutex::new(screen_receiver));
 
-    // 6. Spawn Signaling & Data Transport Server (Dual-radio local & network bridge)
+    // 6. Spawn GUI Dashboard Window
+    let (ui_handle, _ui_thread) = spawn_ui_thread(ui_cmd_tx, sync_dir.clone());
+    let ui = Arc::new(ui_handle);
+    ui.log("⚡ ZeroLink Windows Daemon initialized");
+    ui.log("📋 Win32 Clipboard hook registered on HWND_MESSAGE (0.0% CPU)");
+    ui.log("🔔 Native Windows.UI.Notifications (Toast) manager active");
+    ui.log(&format!("📁 Cloud Filter virtual drive connected at {:?}", sync_dir));
+    ui.log("🎮 Direct3D 11 Video Acceleration context active");
+
+    // 7. Spawn Signaling & Data Transport Server (Dual-radio local & network bridge)
     let listen_port = std::env::var("ZEROLINK_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
@@ -106,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ble_client_for_transport = Arc::clone(&ble_client);
     let inbound_pkt_tx = inbound_packet_tx.clone();
+    let ui_for_network = Arc::clone(&ui);
 
     tokio::spawn(async move {
         let bind_addr = format!("0.0.0.0:{}", listen_port);
@@ -115,8 +129,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "ZeroLink Dual-Radio Signaling & Transport bridge listening on {}",
                     bind_addr
                 );
+                ui_for_network.log(&format!("🌐 Transport bridge listening on {}", bind_addr));
+
                 while let Ok((stream, peer_addr)) = listener.accept().await {
                     tracing::info!("Android signaling peer connected from {}", peer_addr);
+                    ui_for_network.log(&format!("📱 Android peer connected from {}", peer_addr));
+                    ui_for_network.update_device_status("Android Connected", 100, true);
                     let _ = stream.set_nodelay(true);
 
                     let (peer_outbound_tx, mut peer_outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -125,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (mut reader, mut writer) = stream.into_split();
                     let ble_client = Arc::clone(&ble_client_for_transport);
                     let in_tx = inbound_pkt_tx.clone();
+                    let ui_for_peer = Arc::clone(&ui_for_network);
 
                     // Writer task: forward outbound wire frames to peer
                     tokio::spawn(async move {
@@ -145,6 +164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let bytes_read = match reader.read(&mut temp_buf).await {
                                 Ok(0) => {
                                     tracing::info!("Peer {} closed signaling connection", peer_addr);
+                                    ui_for_peer.log(&format!("Peer {} disconnected", peer_addr));
+                                    ui_for_peer.update_device_status("Disconnected", 0, false);
                                     ble_client.reset_session().await;
                                     break;
                                 }
@@ -169,6 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 tracing::info!("Processing Handshake frame from peer");
                                                 if let Ok(name) = ble_client.complete_handshake(&frame.payload).await {
                                                     tracing::info!("Handshake complete! Connected device: {}", name);
+                                                    ui_for_peer.log(&format!("🔒 Handshake verified! Peer: {}", name));
+                                                    ui_for_peer.update_device_status(&name, 100, true);
                                                 }
                                             }
                                             other_type => {
@@ -209,19 +232,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 7. Background Event & Dispatch Loop
+    // 8. Background Event & Dispatch Loop
     let ble_dispatch = Arc::clone(&ble_client);
     let raw_ble_sender = raw_ble_tx.clone();
     let clip_mgr_shared = Arc::clone(&clip_manager);
     let toast_mgr_shared = Arc::clone(&toast_manager);
     let screen_rcvr_shared = Arc::clone(&screen_receiver);
     let cloud_drive_dispatch = Arc::clone(&cloud_drive_shared);
+    let ui_for_events = Arc::clone(&ui);
+    let sync_dir_for_ui = sync_dir.clone();
 
     let mut current_client_outbound: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                // UI Button Actions
+                Some(cmd) = ui_cmd_rx.recv() => {
+                    match cmd {
+                        UiCommand::OpenPhotosFolder => {
+                            ui_for_events.log(&format!("📂 Opening ZeroLink Photos folder: {:?}", sync_dir_for_ui));
+                            let _ = std::process::Command::new("explorer.exe")
+                                .arg(&sync_dir_for_ui)
+                                .spawn();
+                        }
+                        UiCommand::TriggerTestToast => {
+                            ui_for_events.log("🔔 Sending test Toast Notification to Windows Action Center");
+                            let notif = NotificationPayload {
+                                id: "test_toast".to_string(),
+                                package_name: "org.zerolink".to_string(),
+                                app_name: "ZeroLink Desktop".to_string(),
+                                title: "ZeroLink Sync Active".to_string(),
+                                content: "Ultra-low-power BLE & Wi-Fi fabric is running smoothly (<15 MB RAM)".to_string(),
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                                is_ongoing: false,
+                            };
+                            let _ = toast_mgr_shared.display_notification(&notif);
+                        }
+                        UiCommand::TriggerTestClipboard => {
+                            ui_for_events.log("📋 Injecting test text into Windows clipboard");
+                            let payload = ClipboardPayload {
+                                format: ClipboardType::PlainText,
+                                payload_hash: 0x12345678,
+                                timestamp_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                                data: b"ZeroLink: Hello from Windows Clipboard!".to_vec(),
+                            };
+                            clip_mgr_shared.inject_remote_clipboard(&payload);
+                        }
+                        UiCommand::ToggleScreenMirror => {
+                            ui_for_events.log("📱 Screen mirror ready (waiting for Android HEVC video stream)");
+                        }
+                        UiCommand::Quit => {
+                            ui_for_events.log("Closing ZeroLink Daemon...");
+                            let _ = shutdown_tx.send(());
+                            break;
+                        }
+                    }
+                }
+
                 // Outbound local clipboard update
                 Some(payload) = clip_rx.recv() => {
                     tracing::info!(
@@ -229,6 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         payload.payload_hash,
                         payload.data.len()
                     );
+                    ui_for_events.log(&format!("📋 Local clipboard updated: {} bytes synced to Android", payload.data.len()));
                     let serialized = payload.serialize();
                     let _ = ble_dispatch.send_packet(PacketType::Clipboard, &serialized, &raw_ble_sender).await;
                 }
@@ -239,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "CloudFilter placeholder triggered: Waking Android Wi-Fi for bulk transfer: {}",
                         wake_req.reason
                     );
+                    ui_for_events.log(&format!("⚡ CloudFilter triggered Wi-Fi wake: {}", wake_req.reason));
                     let serialized = wake_req.serialize();
                     let _ = ble_dispatch.send_packet(PacketType::WifiWake, &serialized, &raw_ble_sender).await;
                 }
@@ -261,6 +331,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "ZeroLink discovered target device '{}' (addr: 0x{:012X}, PSM: 0x{:04X})",
                         name, address, psm
                     );
+                    ui_for_events.log(&format!("📡 Discovered device '{}' (addr: 0x{:012X}, PSM: 0x{:04X})", name, address, psm));
+                    ui_for_events.update_device_status(&name, 100, false);
                     ble_dispatch.update_device_target(address, psm).await;
                     let _ = ble_dispatch.initiate_handshake(&raw_ble_sender).await;
                 }
@@ -275,6 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     clip_payload.payload_hash,
                                     clip_payload.data.len()
                                 );
+                                ui_for_events.log(&format!("📋 Received remote clipboard from Android ({} bytes)", clip_payload.data.len()));
                                 clip_mgr_shared.inject_remote_clipboard(&clip_payload);
                             }
                         }
@@ -286,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     notif.title,
                                     notif.content
                                 );
+                                ui_for_events.log(&format!("🔔 Notification from {}: {}", notif.app_name, notif.title));
                                 if let Err(e) = toast_mgr_shared.display_notification(&notif) {
                                     tracing::warn!("Failed to display toast notification: {:?}", e);
                                 }
@@ -299,6 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     catalog.files.len(),
                                     catalog.sync_root_id
                                 );
+                                ui_for_events.log(&format!("📁 Received catalog: {} photos/files synced to Virtual Drive", catalog.files.len()));
                                 for file in catalog.files {
                                     let _ = drive.create_placeholder(
                                         &file.relative_path,
@@ -308,6 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             } else if let Ok(meta) = FileMetadata::deserialize(&packet.payload) {
                                 tracing::info!("Received single FileMetadata for '{}'", meta.relative_path);
+                                ui_for_events.log(&format!("📁 Created placeholder for '{}'", meta.relative_path));
                                 let _ = drive.create_placeholder(
                                     &meta.relative_path,
                                     meta.file_size as i64,
@@ -317,6 +393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         PacketType::FileChunk => {
                             if let Ok(chunk) = FileFetchChunk::deserialize(&packet.payload) {
+                                ui_for_events.log(&format!("📥 Hydrated chunk for {}: {} bytes", chunk.file_id, chunk.data.len()));
                                 let drive = cloud_drive_dispatch.lock().await;
                                 let _ = drive.hydrate_file_chunk(&chunk.file_id, chunk.byte_offset, &chunk.data);
                             }
@@ -330,6 +407,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     hb.wifi_connected,
                                     hb.quic_port_active,
                                     hb.device_power_mode
+                                );
+                                ui_for_events.update_device_status(
+                                    if hb.is_charging { "Charging" } else { "Battery" },
+                                    hb.battery_percentage,
+                                    true,
                                 );
                             }
                         }
@@ -358,6 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     wake.port,
                                     wake.reason
                                 );
+                                ui_for_events.log(&format!("⚡ Wi-Fi bulk socket active at {}:{}", wake.target_ip, wake.port));
                                 let ip = if wake.target_ip.is_empty() { "127.0.0.1" } else { &wake.target_ip };
                                 if let Ok(addr) = format!("{}:{}", ip, wake.port).parse() {
                                     tokio::spawn(async move {
@@ -378,11 +461,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tracing::info!("ZeroLink Daemon is active and idling at 0.0% CPU (< 15 MB RAM)");
+    tracing::info!("ZeroLink Daemon is active with UI dashboard (< 15 MB RAM)");
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Shutting down ZeroLink Windows Daemon...");
+    // Wait for shutdown signal (either Ctrl-C or window close)
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutting down ZeroLink Windows Daemon (Ctrl-C)...");
+        }
+        _ = shutdown_rx.recv() => {
+            tracing::info!("Shutting down ZeroLink Windows Daemon (UI Window Closed)...");
+        }
+    }
+
     ble_client.stop_advertisement_watcher().await;
     {
         let mut drive = cloud_drive_shared.lock().await;
@@ -501,21 +591,17 @@ mod tests {
     fn test_screen_mirror_hevc_parser() {
         let receiver = ScreenMirrorReceiver::new();
 
-        // NAL Header: Annex B (0x00000001) + VPS NAL byte ((32 << 1) = 64 = 0x40)
         let vps_nal = [0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0C, 0x01];
         receiver.submit_hevc_packet(&vps_nal, 1000, false);
 
-        // IDR Keyframe NAL byte ((19 << 1) = 38 = 0x26)
         let idr_nal = [0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xAF, 0x99];
         receiver.submit_hevc_packet(&idr_nal, 2000, true);
 
-        // Trailing non-keyframe NAL byte ((1 << 1) = 2 = 0x02)
         let trail_nal = [0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x88, 0x77];
         receiver.submit_hevc_packet(&trail_nal, 3000, false);
 
-        // Note: is_active is false until init_d3d11_hardware is called, but we can verify stats getter works
         let (frames, keyframes, total_bytes) = receiver.stats();
-        assert_eq!(frames, 0); // inactive
+        assert_eq!(frames, 0);
         assert_eq!(keyframes, 0);
         assert_eq!(total_bytes, 0);
     }
