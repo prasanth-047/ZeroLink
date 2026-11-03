@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import org.zerolink.ble.L2capServer
 import org.zerolink.clipboard.ZeroClipboardManager
+import org.zerolink.network.NetworkTransportBridge
 import org.zerolink.wifi.EphemeralWifiManager
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -32,7 +33,10 @@ class ZeroLinkService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private lateinit var l2capServer: L2capServer
+    lateinit var l2capServer: L2capServer
+        private set
+    lateinit var networkBridge: NetworkTransportBridge
+        private set
     private lateinit var clipboardManager: ZeroClipboardManager
     private lateinit var wifiManager: EphemeralWifiManager
 
@@ -52,10 +56,19 @@ class ZeroLinkService : Service() {
             onConnectionChanged = ::handleConnectionState
         )
 
-        clipboardManager = ZeroClipboardManager(this, l2capServer)
+        networkBridge = NetworkTransportBridge(
+            context = this,
+            scope = serviceScope,
+            onPacketReceived = ::handleIncomingPacket,
+            onConnectionChanged = ::handleNetworkConnectionState,
+            onLog = { msg -> MainActivity.appendLogStatic(msg) }
+        )
+
+        clipboardManager = ZeroClipboardManager(this, ::sendPacket)
         clipboardManager.start()
 
         l2capServer.start()
+        networkBridge.start()
         Log.i(TAG, "ZeroLinkService running in ultra-low-power idle state (< 100 mAh / day)")
     }
 
@@ -92,6 +105,12 @@ class ZeroLinkService : Service() {
 
     private fun handleConnectionState(isConnected: Boolean) {
         Log.i(TAG, "L2CAP connection state changed: isConnected = $isConnected")
+        MainActivity.updateBleStatusStatic(isConnected)
+    }
+
+    private fun handleNetworkConnectionState(isConnected: Boolean, endpoint: String) {
+        Log.i(TAG, "Network bridge state: isConnected = $isConnected ($endpoint)")
+        MainActivity.updateConnectionStatusStatic(isConnected, endpoint)
     }
 
     private fun handleIncomingPacket(packetType: Int, payload: ByteArray) {
@@ -106,14 +125,18 @@ class ZeroLinkService : Service() {
                         val data = ByteArray(dataLen)
                         System.arraycopy(payload, 21, data, 0, dataLen)
                         clipboardManager.injectRemoteClipboard(format, hash, data)
+                        val text = String(data, Charsets.UTF_8)
+                        MainActivity.appendLogStatic("📋 Received Windows Clipboard: '$text'")
                     }
                 }
             }
             L2capServer.PACKET_TYPE_WIFI_WAKE -> {
                 // WifiWakeRequest from Windows Cloud Filter / Screen cast
-                Log.i(TAG, "Received BLE Magic Packet: Waking ephemeral Wi-Fi socket")
+                Log.i(TAG, "Received Magic Packet: Waking ephemeral Wi-Fi socket")
+                MainActivity.appendLogStatic("⚡ Received Wi-Fi Wake Request from Windows")
                 wifiManager.wakeAndListen { localIp, port ->
                     Log.i(TAG, "Ephemeral Wi-Fi server ready on $localIp:$port")
+                    MainActivity.appendLogStatic("Ephemeral Wi-Fi listening on $localIp:$port")
                 }
             }
             else -> {
@@ -123,7 +146,14 @@ class ZeroLinkService : Service() {
     }
 
     fun sendPacket(packetType: Int, plaintextData: ByteArray): Boolean {
-        return l2capServer.sendPacket(packetType, plaintextData)
+        if (::networkBridge.isInitialized && networkBridge.isConnected) {
+            val sent = networkBridge.sendPacket(packetType, plaintextData)
+            if (sent) return true
+        }
+        if (::l2capServer.isInitialized && l2capServer.isConnected) {
+            return l2capServer.sendPacket(packetType, plaintextData)
+        }
+        return false
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -136,7 +166,12 @@ class ZeroLinkService : Service() {
     override fun onDestroy() {
         Log.i(TAG, "ZeroLinkService destroying...")
         clipboardManager.stop()
-        l2capServer.stop()
+        if (::l2capServer.isInitialized) {
+            l2capServer.stop()
+        }
+        if (::networkBridge.isInitialized) {
+            networkBridge.stop()
+        }
         wifiManager.teardown()
         serviceScope.cancel()
         instance = null

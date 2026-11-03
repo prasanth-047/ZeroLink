@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 class ZeroClipboardManager(
     private val context: Context,
-    private val l2capServer: L2capServer
+    private val packetSender: (packetType: Int, data: ByteArray) -> Boolean
 ) {
 
     companion object {
@@ -91,7 +91,7 @@ class ZeroClipboardManager(
             textBytes
         ) ?: return
 
-        val sent = l2capServer.sendPacket(L2capServer.PACKET_TYPE_CLIPBOARD, serialized)
+        val sent = packetSender(L2capServer.PACKET_TYPE_CLIPBOARD, serialized)
         if (sent) {
             Log.i(TAG, "Local clipboard synced to Windows (hash: ${java.lang.Long.toHexString(hash)}, len: ${textBytes.size})")
         }

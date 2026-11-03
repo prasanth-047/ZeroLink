@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = stream.set_nodelay(true);
 
                     let (peer_outbound_tx, mut peer_outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-                    let _ = active_client_tx.send(peer_outbound_tx);
+                    let _ = active_client_tx.send(peer_outbound_tx.clone());
 
                     let (mut reader, mut writer) = stream.into_split();
                     let ble_client = Arc::clone(&ble_client_for_transport);
@@ -154,6 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     });
+
+                    // Automatically initiate secure handshake with connected peer
+                    if let Err(e) = ble_client.initiate_handshake(&peer_outbound_tx).await {
+                        tracing::warn!("Failed to dispatch HandshakeInit to {}: {}", peer_addr, e);
+                    }
 
                     // Reader task: parse length-prefixed frames, decrypt, and dispatch
                     tokio::spawn(async move {

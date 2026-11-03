@@ -220,18 +220,22 @@ class L2capServer(
 
         val replyPayload = replyBuf.array()
         // HandshakeReply frame has sequence 0, unencrypted
-        val frameBuf = ByteBuffer.allocate(HEADER_SIZE + replyPayload.size).order(ByteOrder.BIG_ENDIAN)
+        val frameBuf = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.BIG_ENDIAN)
         frameBuf.putShort(0x5A4C.toShort()) // Magic
         frameBuf.put(1.toByte())           // Version
         frameBuf.put(PACKET_TYPE_HANDSHAKE.toByte())
         frameBuf.putInt(replyPayload.size)
         frameBuf.putLong(0L)               // Sequence 0
-        frameBuf.putInt(0)                 // Header CRC placeholder
 
-        val rawFrame = frameBuf.array()
+        // Compute valid CRC32 over the 16-byte header prefix
+        val crc32 = java.util.zip.CRC32()
+        crc32.update(frameBuf.array(), 0, 16)
+        frameBuf.putInt(crc32.value.toInt())
+
+        val rawHeader = frameBuf.array()
         val out = outputStream ?: return
         synchronized(out) {
-            out.write(rawFrame)
+            out.write(rawHeader)
             out.write(replyPayload)
             out.flush()
         }
