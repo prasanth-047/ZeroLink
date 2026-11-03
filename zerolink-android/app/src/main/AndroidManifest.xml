@@ -40,7 +40,7 @@
     <application
         android:name=".ZeroLinkApplication"
         android:allowBackup="false"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@android:drawable/stat_sys_data_bluetooth"
         android:label="ZeroLink"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.DayNight"
