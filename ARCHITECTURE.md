@@ -149,6 +149,25 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
 +---------------------------------------------------------------+
 ```
 
+### 5.1 Packet Types
+
+| Type | Value | Direction | Payload |
+| :--- | :--- | :--- | :--- |
+| `Handshake` | `0x01` | Bidirectional | X25519 pubkey, salt / reply + auth tag |
+| `Signaling` | `0x02` | Bidirectional | Session control |
+| `Notification` | `0x03` | Android → Windows | `NotificationPayload` |
+| `Clipboard` | `0x04` | Bidirectional | `ClipboardPayload` (format, SipHash, timestamp, bytes) |
+| `FileMetadata` | `0x05` | Android → Windows | `FileCatalog` / `FileMetadata` |
+| `FileChunk` | `0x06` | Android → Windows | `FileFetchChunk` |
+| `WifiWake` | `0x07` | Bidirectional | `WifiWakePayload` |
+| `ScreenCast` | `0x08` | Android → Windows | `VideoFrameHeader` + HEVC NAL units |
+| `Heartbeat` | `0x09` | Android → Windows | Battery, charging, Wi-Fi, QUIC port, power mode |
+| `KeepAlive` | `0x0A` | Bidirectional | Empty |
+| `NotificationAction` | `0x0B` | Windows → Android | `NotificationActionPayload` (notification id, action id, reply text) |
+| `MediaControl` | `0x0C` | Android → Windows | `MediaControlPayload` (1-byte command) |
+| `ScreenInput` | `0x0D` | Windows → Android | `ScreenInputPayload` (normalized x/y, action, wheel delta) |
+| `MediaState` | `0x0E` | Windows → Android | `MediaStatePayload` (title, artist, album, app, playback, timeline) |
+
 ---
 
 ## 6. Windows Daemon & Native Win32 Subsystems
@@ -166,8 +185,11 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
 
 ### 6.2 Native Windows Toasts (`Windows.UI.Notifications`)
 - No Electron, no web views.
-- Daemon invokes WinRT `ToastNotificationManager::GetDefault()` and constructs XML toast elements via native COM vtables.
+- Daemon invokes WinRT `ToastNotificationManager::CreateToastNotifierWithId` and constructs XML toast elements via native COM vtables.
 - Supports inline dismiss and reply buttons; reply actions are piped back to the Android daemon over L2CAP to trigger `RemoteInput` pending intents.
+- **Toast retention:** the daemon keeps up to 32 live `ToastNotification` objects (and their `Activated` handlers) so WinRT can deliver activation events. The previous fire-and-forget implementation could never receive inline replies.
+- **Activation model:** activation is handled in-process while the resident daemon is running. True background activation (daemon stopped) would additionally require a COM `INotificationActivationCallback` implementation registered with an AUMID Start Menu shortcut.
+- Toast arguments use the form `action=reply|dismiss&id=<notification key>` with percent-encoding; the reply text is read from the `quickReply` input of `ToastNotificationActivatedEventArgs.UserInput`.
 
 ### 6.3 Cloud Filter API (`cldapi.dll`) Virtual File System
 - Phone storage (DCIM / Downloads) is exposed as a virtual sync root using Windows Cloud Files API (`CfRegisterSyncRoot`).
@@ -181,6 +203,13 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
   5. Daemon writes data to the placeholder via `CfExecute(CF_OPERATION_TYPE_TRANSFER_DATA)`.
   6. Wi-Fi tears down immediately after transfer.
 
+### 6.4 Media Playback Control (GSMTC)
+- `windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager` provides the active session.
+- `query_state()` reads title, artist, album, source app AUMID, playback status, and timeline position/duration.
+- Commands: Play, Pause, Toggle, Next, Previous, Volume Up/Down (volume falls back to multimedia `keybd_event` because GSMTC has no volume API).
+- State is queried on demand: piggybacked on the existing 10-second Android heartbeat and immediately after every remote command. No dedicated polling timer is created, preserving the 0.0% idle CPU target.
+- Android renders the state in a MainActivity card and in the ongoing notification (Prev / Play-Pause / Next actions via `MediaControlReceiver`).
+
 ---
 
 ## 7. Android Event-Driven Subsystems & Doze Optimization
@@ -191,13 +220,18 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
   - Extracts title, text, app package, large icon bitmap (downsampled to 96x96 WebP).
   - Serializes to FlatBuffers `NotificationEvent`.
   - Pushes to native L2CAP buffer through JNI without Kotlin string allocation.
+- **Inline reply actions:** the listener inspects `Notification.Action.remoteInputs` and caches the originating `PendingIntent` plus the `RemoteInput[]` descriptors in a bounded 32-entry LRU (`NotificationActionCache`), keyed by `StatusBarNotification.key`.
+- When Windows sends `NotificationAction` (`0x0B`), the service calls `RemoteInput.addResultsToIntent()` with the typed text and fires the cached `PendingIntent`. A `dismiss` action instead invokes `NotificationListenerService.cancelNotification(key)`.
+- Entries are evicted on `onNotificationRemoved`, on `PendingIntent.CanceledException`, and when the service is destroyed.
 
-### 7.2 Accessibility-Free Background Clipboard Sync
-- Android 10+ blocks background apps from reading `ClipboardManager`.
-- ZeroLink avoids battery-draining Accessibility Services.
-- Approaches:
-  - Push from Windows to Android: Android service calls `ClipboardManager.setPrimaryClip` from native foreground service or quick settings action without accessibility permission.
-  - Pull from Android to Windows: Triggered by user interaction (Quick Settings Tile, Share Sheet target, or contextual toast/notification action button), keeping battery drain at 0%.
+### 7.2 Zero-Root Background Clipboard Sync (Triple Guard)
+- Android 10+ blocks background apps from reading `ClipboardManager` without window focus.
+- ZeroLink implements a **Triple-Guard Zero-Root System**:
+  1. **Accessibility Service (`ZeroAccessibilityService`)** — official Android framework, `canRetrieveWindowContent="false"` so window content is never inspected. Clipboard reads occur only after user interaction events (click, text selection, window change). The same service optionally provides rootless gesture injection (`canPerformGestures="true"`) for `ScreenInput`.
+  2. **Notification quick action** — `[ 📋 Sync Clipboard ]` in the persistent foreground notification for one-tap sync from any app.
+  3. **Quick Settings tile** — `ZeroClipboardTileService` for one-tap sync from the notification panel.
+- **Anti-echo hashing:** SHA-256/SipHash comparisons prevent remote sync feedback loops.
+- Push from Windows to Android uses `ClipboardManager.setPrimaryClip` from the foreground service, so no accessibility permission is required for that direction.
 
 ### 7.3 MediaProjection & H.265 Dynamic FPS Mirroring
 - Android `MediaCodec` initialized with `MIMETYPE_VIDEO_HEVC`.
@@ -210,6 +244,8 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
     - If display buffer is untouched, encoder produces 0 frames.
     - When touch or damage rectangle is detected, encoder produces up to 60 FPS in hardware with intra-refresh slices.
 - Low-latency delivery over QUIC Wi-Fi socket, decoded on Windows via D3D11 Video Acceleration (DXVA2/NVDEC/AMF).
+
+> **Implementation status (current):** Android MediaCodec H.265 encoding and the packetized transport are implemented. The Windows `ScreenMirrorReceiver` creates a D3D11 device and parses/reassembles HEVC NAL metadata, but does not yet decode or render frames. Interactive `ScreenInput` (`0x0D`) capture therefore has no video window to attach to yet; Android-side gesture injection is implemented and ready.
 
 ---
 
