@@ -151,6 +151,17 @@
             android:textSize="14sp" />
 
         <Button
+            android:id="@+id/btn_accessibility_service"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#334155"
+            android:text="⚡ Background Clipboard Auto-Sync (No Root)"
+            android:textAllCaps="false"
+            android:textColor="#F1F5F9"
+            android:textSize="14sp" />
+
+        <Button
             android:id="@+id/btn_battery_optimization"
             android:layout_width="match_parent"
             android:layout_height="50dp"

@@ -87,6 +87,41 @@
             </intent-filter>
         </receiver>
 
+        <!-- Zero-Root Clipboard Auto-Sync Accessibility Service -->
+        <service
+            android:name=".clipboard.ZeroAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:label="@string/accessibility_service_label"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Quick Settings Tile for 1-Tap Clipboard Sync -->
+        <service
+            android:name=".clipboard.ZeroClipboardTileService"
+            android:icon="@android:drawable/ic_menu_send"
+            android:label="@string/tile_clipboard_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- Notification Action Receiver -->
+        <receiver
+            android:name=".clipboard.ClipboardActionReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="org.zerolink.action.SYNC_CLIPBOARD" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

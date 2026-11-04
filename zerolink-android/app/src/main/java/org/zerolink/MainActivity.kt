@@ -64,6 +64,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnGrantPermissions: Button
     private lateinit var btnNotificationAccess: Button
     private lateinit var btnBatteryOptimization: Button
+    private lateinit var btnAccessibilityAccess: Button
     private lateinit var btnTestClipboard: Button
     private lateinit var btnSendNotif: Button
     private lateinit var btnSyncPhotos: Button
@@ -118,6 +119,7 @@ class MainActivity : AppCompatActivity() {
         btnToggleService = findViewById(R.id.btn_toggle_service)
         btnGrantPermissions = findViewById(R.id.btn_grant_permissions)
         btnNotificationAccess = findViewById(R.id.btn_notification_access)
+        btnAccessibilityAccess = findViewById(R.id.btn_accessibility_service)
         btnBatteryOptimization = findViewById(R.id.btn_battery_optimization)
         btnTestClipboard = findViewById(R.id.btn_test_clipboard)
         btnSendNotif = findViewById(R.id.btn_send_notif)
@@ -209,6 +211,21 @@ class MainActivity : AppCompatActivity() {
                 startActivity(intent)
             } catch (e: Exception) {
                 appendLog("Error opening notification settings: ${e.message}")
+            }
+        }
+
+        btnAccessibilityAccess.setOnClickListener {
+            appendLog("Opening Accessibility Settings for Background Clipboard Auto-Sync...")
+            try {
+                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                startActivity(intent)
+                Toast.makeText(
+                    this,
+                    "Enable 'ZeroLink Clipboard Auto-Sync' in Installed Apps",
+                    Toast.LENGTH_LONG
+                ).show()
+            } catch (e: Exception) {
+                appendLog("Error opening accessibility settings: ${e.message}")
             }
         }
 
@@ -368,6 +385,15 @@ class MainActivity : AppCompatActivity() {
         val hasPerms = hasRequiredPermissions()
         btnGrantPermissions.isEnabled = !hasPerms
         btnGrantPermissions.text = if (hasPerms) "✅ Permissions Granted" else "🔑 Grant Bluetooth Permissions"
+
+        val a11yActive = org.zerolink.clipboard.ZeroAccessibilityService.isRunning
+        if (a11yActive) {
+            btnAccessibilityAccess.text = "⚡ Clipboard Auto-Sync: 🟢 Active (No Root)"
+            btnAccessibilityAccess.setBackgroundColor(0xFF16A34A.toInt()) // Green
+        } else {
+            btnAccessibilityAccess.text = "⚡ Enable Clipboard Auto-Sync (No Root)"
+            btnAccessibilityAccess.setBackgroundColor(0xFF334155.toInt())
+        }
     }
 
     fun updateConnectionStatus(isConnected: Boolean, endpoint: String) {

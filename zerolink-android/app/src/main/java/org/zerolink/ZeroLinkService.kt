@@ -49,7 +49,7 @@ class ZeroLinkService : Service() {
         private set
     lateinit var networkBridge: NetworkTransportBridge
         private set
-    private lateinit var clipboardManager: ZeroClipboardManager
+    lateinit var clipboardManager: ZeroClipboardManager
     private lateinit var wifiManager: EphemeralWifiManager
 
     private var heartbeatJob: Job? = null
@@ -104,11 +104,22 @@ class ZeroLinkService : Service() {
             )
         } else null
 
+        val syncClipboardIntent = Intent(this, org.zerolink.clipboard.ClipboardActionReceiver::class.java).apply {
+            action = org.zerolink.clipboard.ClipboardActionReceiver.ACTION_SYNC_CLIPBOARD
+        }
+        val syncClipboardPendingIntent = PendingIntent.getBroadcast(
+            this,
+            1,
+            syncClipboardIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val notification: Notification = NotificationCompat.Builder(this, ZeroLinkApplication.CHANNEL_ID)
             .setContentTitle("ZeroLink Active")
             .setContentText("Ultra-low-power BLE standby")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(pendingIntent)
+            .addAction(android.R.drawable.ic_menu_send, "📋 Sync Clipboard", syncClipboardPendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN) // Minimize battery impact
             .build()

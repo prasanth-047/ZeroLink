@@ -1,3 +1,6 @@
 <resources>
     <string name="app_name">ZeroLink</string>
+    <string name="accessibility_service_label">ZeroLink Clipboard Auto-Sync</string>
+    <string name="accessibility_service_desc">Enables automatic background clipboard synchronization between your phone and Windows PC without root.</string>
+    <string name="tile_clipboard_label">Sync Clipboard</string>
 </resources>
