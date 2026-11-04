@@ -10,6 +10,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetS
 mod ble_client;
 mod clipboard;
 mod cloud_filter;
+mod media;
 mod notifications;
 mod quic_client;
 mod screen_viewer;
@@ -25,7 +26,8 @@ use ui::{spawn_ui_thread, UiCommand};
 use zerolink_core::framing::{Frame, PacketType, HEADER_SIZE};
 use zerolink_core::protocol::{
     ClipboardPayload, ClipboardType, FileCatalog, FileFetchChunk, FileMetadata, Heartbeat,
-    NotificationPayload, VideoFrameHeader, WifiWakePayload,
+    MediaControlPayload, MediaStatePayload, NotificationActionPayload, NotificationPayload,
+    VideoFrameHeader, WifiWakePayload,
 };
 
 #[derive(Debug)]
@@ -67,6 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (inbound_packet_tx, mut inbound_packet_rx) = mpsc::unbounded_channel::<InboundPacket>();
     let (discovery_tx, mut discovery_rx) = mpsc::unbounded_channel::<(u64, u16, String)>();
     let (ui_cmd_tx, mut ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+    let (notif_action_tx, mut notif_action_rx) =
+        mpsc::unbounded_channel::<NotificationActionPayload>();
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
     // 1. Start Win32 Clipboard Listener (WM_CLIPBOARDUPDATE, 0.0% Idle CPU)
@@ -75,7 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Win32 Clipboard Listener registered on HWND_MESSAGE");
 
     // 2. Initialize Native WinRT Toast Notification Manager (No Electron / No WebView)
-    let toast_manager = Arc::new(WindowsToastManager::new("ZeroLink.DesktopClient"));
+    let toast_manager = Arc::new(WindowsToastManager::new(
+        "ZeroLink.DesktopClient",
+        notif_action_tx,
+    ));
     tracing::info!("Native Windows.UI.Notifications manager initialized");
 
     // 3. Initialize Cloud Filter API (cldapi.dll) Virtual Drive
@@ -248,10 +255,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sync_dir_for_ui = sync_dir.clone();
 
     let mut current_client_outbound: Option<mpsc::UnboundedSender<Vec<u8>>> = None;
+    let mut last_media_state: Option<MediaStatePayload> = None;
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                // Outbound toast quick-reply / dismiss actions from WinRT activation
+                Some(action) = notif_action_rx.recv() => {
+                    tracing::info!(
+                        "Toast action '{}' for notification '{}' (reply bytes: {})",
+                        action.action_id,
+                        action.notification_id,
+                        action.reply_text.len()
+                    );
+                    if action.action_id == "reply" && !action.reply_text.is_empty() {
+                        ui_for_events.log(&format!("💬 Quick reply sent to Android: '{}'", action.reply_text));
+                    } else {
+                        ui_for_events.log(&format!("🔕 Toast action '{}' dispatched to Android", action.action_id));
+                    }
+                    let serialized = action.serialize();
+                    if let Err(e) = ble_dispatch
+                        .send_packet(PacketType::NotificationAction, &serialized, &raw_ble_sender)
+                        .await
+                    {
+                        tracing::warn!("Failed to forward toast action to Android: {}", e);
+                    }
+                }
                 // UI Button Actions
                 Some(cmd) = ui_cmd_rx.recv() => {
                     match cmd {
@@ -427,6 +456,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     hb.battery_percentage,
                                     true,
                                 );
+
+                                // Piggyback media-state refresh on the existing 10 s heartbeat.
+                                // No dedicated timer is created, preserving the 0.0% idle CPU claim.
+                                let state = tokio::task::spawn_blocking(media::query_state)
+                                    .await
+                                    .unwrap_or(None);
+                                if state != last_media_state {
+                                    if let Some(ref now_playing) = state {
+                                        tracing::info!(
+                                            "Media session: {} — {} ({})",
+                                            now_playing.title,
+                                            now_playing.artist,
+                                            if now_playing.is_playing { "playing" } else { "paused" }
+                                        );
+                                        ui_for_events.log(&format!(
+                                            "🎵 Media: {} — {} ({})",
+                                            now_playing.title,
+                                            now_playing.artist,
+                                            if now_playing.is_playing { "Playing" } else { "Paused" }
+                                        ));
+                                        let serialized = now_playing.serialize();
+                                        let _ = ble_dispatch
+                                            .send_packet(PacketType::MediaState, &serialized, &raw_ble_sender)
+                                            .await;
+                                    }
+                                    last_media_state = state;
+                                }
+                            }
+                        }
+                        PacketType::MediaControl => {
+                            if let Ok(control) = MediaControlPayload::deserialize(&packet.payload) {
+                                tracing::info!("Media command from Android: {:?}", control.command);
+                                ui_for_events.log(&format!("🎵 Media command from Android: {:?}", control.command));
+                                let command = control.command;
+                                let executed = tokio::task::spawn_blocking(move || {
+                                    media::execute_command(command)
+                                })
+                                .await
+                                .unwrap_or(false);
+
+                                if !executed {
+                                    tracing::warn!("Media command {:?} was not accepted by the active session", command);
+                                }
+
+                                // Reply with a fresh snapshot so the phone UI updates immediately.
+                                let state = tokio::task::spawn_blocking(media::query_state)
+                                    .await
+                                    .unwrap_or(None);
+                                if let Some(ref now_playing) = state {
+                                    let serialized = now_playing.serialize();
+                                    let _ = ble_dispatch
+                                        .send_packet(PacketType::MediaState, &serialized, &raw_ble_sender)
+                                        .await;
+                                }
+                                last_media_state = state;
                             }
                         }
                         PacketType::ScreenCast => {

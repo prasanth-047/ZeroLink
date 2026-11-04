@@ -12,6 +12,39 @@ data class CatalogItem(
     val isDirectory: Boolean = false
 )
 
+data class NotificationAction(
+    val notificationId: String,
+    val actionId: String,
+    val replyText: String
+)
+
+data class MediaState(
+    val title: String,
+    val artist: String,
+    val album: String,
+    val appName: String,
+    val isPlaying: Boolean,
+    val positionMs: Long,
+    val durationMs: Long
+)
+
+data class ScreenInput(
+    val action: Int,
+    val x: Float,
+    val y: Float,
+    val scrollDelta: Int
+)
+
+object MediaCommand {
+    const val PLAY = 0
+    const val PAUSE = 1
+    const val TOGGLE_PLAY_PAUSE = 2
+    const val NEXT = 3
+    const val PREVIOUS = 4
+    const val VOLUME_UP = 5
+    const val VOLUME_DOWN = 6
+}
+
 object ZeroLinkProtocol {
 
     /**
@@ -129,5 +162,89 @@ object ZeroLinkProtocol {
         buf.put(contentBytes)
 
         return buf.array()
+    }
+
+    /**
+     * Serializes a toast action result (reply/dismiss) matching the Windows
+     * NotificationActionPayload wire format.
+     */
+    fun serializeNotificationAction(
+        notificationId: String,
+        actionId: String,
+        replyText: String
+    ): ByteArray {
+        val values = listOf(notificationId, actionId, replyText)
+        val encoded = values.map { it.toByteArray(Charsets.UTF_8) }
+        val total = encoded.sumOf { 2 + it.size }
+        val buf = ByteBuffer.allocate(total).order(ByteOrder.BIG_ENDIAN)
+        for (bytes in encoded) {
+            buf.putShort(bytes.size.toShort())
+            buf.put(bytes)
+        }
+        return buf.array()
+    }
+
+    fun deserializeNotificationAction(payload: ByteArray): NotificationAction? {
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        fun readString(): String? {
+            if (buf.remaining() < 2) return null
+            val len = buf.short.toInt() and 0xFFFF
+            if (buf.remaining() < len) return null
+            val bytes = ByteArray(len)
+            buf.get(bytes)
+            return String(bytes, Charsets.UTF_8)
+        }
+
+        val notificationId = readString() ?: return null
+        val actionId = readString() ?: return null
+        val replyText = readString() ?: return null
+        return NotificationAction(notificationId, actionId, replyText)
+    }
+
+    /** Serializes a single media command byte (Windows MediaControlPayload). */
+    fun serializeMediaControl(command: Int): ByteArray = byteArrayOf(command.toByte())
+
+    /** Parses a normalized screen-input event sent by the Windows viewer. */
+    fun deserializeScreenInput(payload: ByteArray): ScreenInput? {
+        if (payload.size < 11) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        val action = buf.get().toInt() and 0xFF
+        val x = buf.float.coerceIn(0f, 1f)
+        val y = buf.float.coerceIn(0f, 1f)
+        val scrollDelta = buf.short.toInt()
+        return ScreenInput(action, x, y, scrollDelta)
+    }
+
+    /** Parses a MediaState payload sent by the Windows GSMTC bridge. */
+    fun deserializeMediaState(payload: ByteArray): MediaState? {
+        if (payload.size < 17) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        val positionMs = buf.long
+        val durationMs = buf.long
+        val isPlaying = buf.get().toInt() != 0
+
+        fun readString(): String? {
+            if (buf.remaining() < 2) return null
+            val len = buf.short.toInt() and 0xFFFF
+            if (buf.remaining() < len) return null
+            val bytes = ByteArray(len)
+            buf.get(bytes)
+            return String(bytes, Charsets.UTF_8)
+        }
+
+        val title = readString() ?: return null
+        val artist = readString() ?: return null
+        val album = readString() ?: return null
+        val appName = readString() ?: return null
+
+        return MediaState(
+            title = title,
+            artist = artist,
+            album = album,
+            appName = appName,
+            isPlaying = isPlaying,
+            positionMs = positionMs,
+            durationMs = durationMs
+        )
     }
 }

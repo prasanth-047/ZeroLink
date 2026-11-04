@@ -21,6 +21,10 @@ pub enum PacketType {
     ScreenCast = 0x08,
     Heartbeat = 0x09,
     KeepAlive = 0x0A,
+    NotificationAction = 0x0B,
+    MediaControl = 0x0C,
+    ScreenInput = 0x0D,
+    MediaState = 0x0E,
 }
 
 impl PacketType {
@@ -36,6 +40,10 @@ impl PacketType {
             0x08 => Ok(Self::ScreenCast),
             0x09 => Ok(Self::Heartbeat),
             0x0A => Ok(Self::KeepAlive),
+            0x0B => Ok(Self::NotificationAction),
+            0x0C => Ok(Self::MediaControl),
+            0x0D => Ok(Self::ScreenInput),
+            0x0E => Ok(Self::MediaState),
             _ => Err(ZeroLinkError::SerializationError(format!(
                 "Unknown packet type byte: {:#04x}",
                 value

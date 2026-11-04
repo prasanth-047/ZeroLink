@@ -278,6 +278,261 @@ impl NotificationPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationActionPayload {
+    pub notification_id: String,
+    pub action_id: String,
+    pub reply_text: String,
+}
+
+impl NotificationActionPayload {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let append_str = |vec: &mut Vec<u8>, s: &str| {
+            let b = s.as_bytes();
+            let mut len_b = [0u8; 2];
+            BigEndian::write_u16(&mut len_b, b.len() as u16);
+            vec.extend_from_slice(&len_b);
+            vec.extend_from_slice(b);
+        };
+
+        append_str(&mut out, &self.notification_id);
+        append_str(&mut out, &self.action_id);
+        append_str(&mut out, &self.reply_text);
+        out
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        let mut offset = 0;
+
+        let read_str = |offset: &mut usize| -> Result<String> {
+            if buf.len() < *offset + 2 {
+                return Err(ZeroLinkError::IncompleteFrame {
+                    needed: *offset + 2,
+                    available: buf.len(),
+                });
+            }
+            let len = BigEndian::read_u16(&buf[*offset..*offset + 2]) as usize;
+            *offset += 2;
+            if buf.len() < *offset + len {
+                return Err(ZeroLinkError::IncompleteFrame {
+                    needed: *offset + len,
+                    available: buf.len(),
+                });
+            }
+            let s = String::from_utf8_lossy(&buf[*offset..*offset + len]).to_string();
+            *offset += len;
+            Ok(s)
+        };
+
+        let notification_id = read_str(&mut offset)?;
+        let action_id = read_str(&mut offset)?;
+        let reply_text = read_str(&mut offset)?;
+
+        Ok(Self {
+            notification_id,
+            action_id,
+            reply_text,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaCommand {
+    Play = 0,
+    Pause = 1,
+    TogglePlayPause = 2,
+    Next = 3,
+    Previous = 4,
+    VolumeUp = 5,
+    VolumeDown = 6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaControlPayload {
+    pub command: MediaCommand,
+}
+
+impl MediaControlPayload {
+    pub fn serialize(&self) -> Vec<u8> {
+        vec![self.command as u8]
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        if buf.is_empty() {
+            return Err(ZeroLinkError::IncompleteFrame {
+                needed: 1,
+                available: 0,
+            });
+        }
+        let command = match buf[0] {
+            0 => MediaCommand::Play,
+            1 => MediaCommand::Pause,
+            2 => MediaCommand::TogglePlayPause,
+            3 => MediaCommand::Next,
+            4 => MediaCommand::Previous,
+            5 => MediaCommand::VolumeUp,
+            6 => MediaCommand::VolumeDown,
+            _ => {
+                return Err(ZeroLinkError::SerializationError(
+                    "Invalid media command".into(),
+                ))
+            }
+        };
+        Ok(Self { command })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaStatePayload {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub app_name: String,
+    pub is_playing: bool,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+}
+
+impl MediaStatePayload {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut num_buf = [0u8; 8];
+        BigEndian::write_u64(&mut num_buf, self.position_ms);
+        out.extend_from_slice(&num_buf);
+        BigEndian::write_u64(&mut num_buf, self.duration_ms);
+        out.extend_from_slice(&num_buf);
+        out.push(if self.is_playing { 1 } else { 0 });
+
+        let append_str = |vec: &mut Vec<u8>, s: &str| {
+            let b = s.as_bytes();
+            let mut len_b = [0u8; 2];
+            BigEndian::write_u16(&mut len_b, b.len() as u16);
+            vec.extend_from_slice(&len_b);
+            vec.extend_from_slice(b);
+        };
+
+        append_str(&mut out, &self.title);
+        append_str(&mut out, &self.artist);
+        append_str(&mut out, &self.album);
+        append_str(&mut out, &self.app_name);
+        out
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 17 {
+            return Err(ZeroLinkError::IncompleteFrame {
+                needed: 17,
+                available: buf.len(),
+            });
+        }
+        let position_ms = BigEndian::read_u64(&buf[0..8]);
+        let duration_ms = BigEndian::read_u64(&buf[8..16]);
+        let is_playing = buf[16] != 0;
+        let mut offset = 17;
+
+        let read_str = |offset: &mut usize| -> Result<String> {
+            if buf.len() < *offset + 2 {
+                return Err(ZeroLinkError::IncompleteFrame {
+                    needed: *offset + 2,
+                    available: buf.len(),
+                });
+            }
+            let len = BigEndian::read_u16(&buf[*offset..*offset + 2]) as usize;
+            *offset += 2;
+            if buf.len() < *offset + len {
+                return Err(ZeroLinkError::IncompleteFrame {
+                    needed: *offset + len,
+                    available: buf.len(),
+                });
+            }
+            let s = String::from_utf8_lossy(&buf[*offset..*offset + len]).to_string();
+            *offset += len;
+            Ok(s)
+        };
+
+        let title = read_str(&mut offset)?;
+        let artist = read_str(&mut offset)?;
+        let album = read_str(&mut offset)?;
+        let app_name = read_str(&mut offset)?;
+
+        Ok(Self {
+            title,
+            artist,
+            album,
+            app_name,
+            is_playing,
+            position_ms,
+            duration_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenInputAction {
+    Down = 0,
+    Move = 1,
+    Up = 2,
+    Scroll = 3,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreenInputPayload {
+    pub action: ScreenInputAction,
+    /// Normalized horizontal position in the range 0.0..=1.0.
+    pub x: f32,
+    /// Normalized vertical position in the range 0.0..=1.0.
+    pub y: f32,
+    /// Wheel delta (negative scrolls up, positive scrolls down).
+    pub scroll_delta: i16,
+}
+
+impl ScreenInputPayload {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(11);
+        out.push(self.action as u8);
+        let mut f_buf = [0u8; 4];
+        BigEndian::write_f32(&mut f_buf, self.x.clamp(0.0, 1.0));
+        out.extend_from_slice(&f_buf);
+        BigEndian::write_f32(&mut f_buf, self.y.clamp(0.0, 1.0));
+        out.extend_from_slice(&f_buf);
+        let mut i_buf = [0u8; 2];
+        BigEndian::write_i16(&mut i_buf, self.scroll_delta);
+        out.extend_from_slice(&i_buf);
+        out
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 11 {
+            return Err(ZeroLinkError::IncompleteFrame {
+                needed: 11,
+                available: buf.len(),
+            });
+        }
+        let action = match buf[0] {
+            0 => ScreenInputAction::Down,
+            1 => ScreenInputAction::Move,
+            2 => ScreenInputAction::Up,
+            3 => ScreenInputAction::Scroll,
+            _ => {
+                return Err(ZeroLinkError::SerializationError(
+                    "Invalid screen input action".into(),
+                ))
+            }
+        };
+        let x = BigEndian::read_f32(&buf[1..5]).clamp(0.0, 1.0);
+        let y = BigEndian::read_f32(&buf[5..9]).clamp(0.0, 1.0);
+        let scroll_delta = BigEndian::read_i16(&buf[9..11]);
+
+        Ok(Self {
+            action,
+            x,
+            y,
+            scroll_delta,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WifiWakePayload {
     pub target_ip: String,
     pub port: u16,
@@ -872,6 +1127,64 @@ mod tests {
         let b = notif.serialize();
         let parsed = NotificationPayload::deserialize(&b).unwrap();
         assert_eq!(notif, parsed);
+    }
+
+    #[test]
+    fn test_notification_action_payload() {
+        let action = NotificationActionPayload {
+            notification_id: "0|com.whatsapp|123|null|10123".to_string(),
+            action_id: "reply_0".to_string(),
+            reply_text: "On my way!".to_string(),
+        };
+        let b = action.serialize();
+        let parsed = NotificationActionPayload::deserialize(&b).unwrap();
+        assert_eq!(action, parsed);
+    }
+
+    #[test]
+    fn test_media_payloads() {
+        let cmd = MediaControlPayload {
+            command: MediaCommand::TogglePlayPause,
+        };
+        let b = cmd.serialize();
+        assert_eq!(MediaControlPayload::deserialize(&b).unwrap(), cmd);
+
+        let state = MediaStatePayload {
+            title: "Song Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            app_name: "Spotify.exe".to_string(),
+            is_playing: true,
+            position_ms: 65_000,
+            duration_ms: 210_000,
+        };
+        let b_state = state.serialize();
+        let parsed_state = MediaStatePayload::deserialize(&b_state).unwrap();
+        assert_eq!(state, parsed_state);
+    }
+
+    #[test]
+    fn test_screen_input_payload() {
+        let input = ScreenInputPayload {
+            action: ScreenInputAction::Down,
+            x: 0.25,
+            y: 0.75,
+            scroll_delta: -120,
+        };
+        let b = input.serialize();
+        let parsed = ScreenInputPayload::deserialize(&b).unwrap();
+        assert_eq!(input, parsed);
+
+        // Out-of-range coordinates are clamped on the wire.
+        let clamped = ScreenInputPayload {
+            action: ScreenInputAction::Move,
+            x: 1.5,
+            y: -0.5,
+            scroll_delta: 0,
+        };
+        let parsed_clamped = ScreenInputPayload::deserialize(&clamped.serialize()).unwrap();
+        assert_eq!(parsed_clamped.x, 1.0);
+        assert_eq!(parsed_clamped.y, 0.0);
     }
 
     #[test]

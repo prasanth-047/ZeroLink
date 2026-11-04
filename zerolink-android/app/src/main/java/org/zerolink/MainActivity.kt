@@ -22,6 +22,8 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import org.zerolink.protocol.MediaCommand
+import org.zerolink.protocol.MediaState
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -52,6 +54,12 @@ class MainActivity : AppCompatActivity() {
                 activeActivity?.updateBleStatus(isConnected)
             }
         }
+
+        fun updateMediaStateStatic(state: MediaState) {
+            mainHandler.post {
+                activeActivity?.updateMediaState(state)
+            }
+        }
     }
 
     private lateinit var tvServiceStatus: TextView
@@ -69,6 +77,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSendNotif: Button
     private lateinit var btnSyncPhotos: Button
     private lateinit var btnScreenMirror: Button
+    private lateinit var tvMediaTitle: TextView
+    private lateinit var tvMediaArtist: TextView
+    private lateinit var tvMediaApp: TextView
+    private lateinit var btnMediaPrev: Button
+    private lateinit var btnMediaToggle: Button
+    private lateinit var btnMediaNext: Button
 
     private var mediaProjectionManager: MediaProjectionManager? = null
 
@@ -125,6 +139,12 @@ class MainActivity : AppCompatActivity() {
         btnSendNotif = findViewById(R.id.btn_send_notif)
         btnSyncPhotos = findViewById(R.id.btn_sync_photos)
         btnScreenMirror = findViewById(R.id.btn_screen_mirror)
+        tvMediaTitle = findViewById(R.id.tv_media_title)
+        tvMediaArtist = findViewById(R.id.tv_media_artist)
+        tvMediaApp = findViewById(R.id.tv_media_app)
+        btnMediaPrev = findViewById(R.id.btn_media_prev)
+        btnMediaToggle = findViewById(R.id.btn_media_toggle)
+        btnMediaNext = findViewById(R.id.btn_media_next)
 
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
@@ -314,6 +334,40 @@ class MainActivity : AppCompatActivity() {
                 appendLog("⚠️ ZeroLinkService is not running")
             }
         }
+
+        btnMediaPrev.setOnClickListener {
+            sendMediaCommand(MediaCommand.PREVIOUS, "⏮ Previous")
+        }
+
+        btnMediaToggle.setOnClickListener {
+            sendMediaCommand(MediaCommand.TOGGLE_PLAY_PAUSE, "⏯ Play/Pause")
+        }
+
+        btnMediaNext.setOnClickListener {
+            sendMediaCommand(MediaCommand.NEXT, "⏭ Next")
+        }
+    }
+
+    private fun sendMediaCommand(command: Int, label: String) {
+        val service = ZeroLinkService.instance
+        if (service != null) {
+            val sent = service.sendMediaCommand(command)
+            if (!sent) {
+                appendLog("⚠️ Failed to send $label (PC not connected)")
+            }
+        } else {
+            appendLog("⚠️ ZeroLinkService is not running")
+        }
+    }
+
+    fun updateMediaState(state: MediaState) {
+        tvMediaTitle.text = state.title.ifBlank { "No media playing" }
+        tvMediaArtist.text = listOf(state.artist, state.album)
+            .filter { it.isNotBlank() }
+            .joinToString(" • ")
+            .ifBlank { "—" }
+        tvMediaApp.text = state.appName.ifBlank { "Windows media session" }
+        btnMediaToggle.text = if (state.isPlaying) "⏸" else "▶"
     }
 
     private fun startZeroLinkService() {
@@ -380,6 +434,11 @@ class MainActivity : AppCompatActivity() {
 
             btnScreenMirror.text = "📱 Start Screen Mirroring"
             btnScreenMirror.setBackgroundColor(0xFF334155.toInt())
+
+            tvMediaTitle.text = "No media playing"
+            tvMediaArtist.text = "—"
+            tvMediaApp.text = "Windows media session"
+            btnMediaToggle.text = "▶"
         }
 
         val hasPerms = hasRequiredPermissions()

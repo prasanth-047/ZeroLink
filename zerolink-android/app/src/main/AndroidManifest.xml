@@ -122,6 +122,15 @@
             </intent-filter>
         </receiver>
 
+        <!-- Media Playback Control Receiver (ongoing notification actions) -->
+        <receiver
+            android:name=".media.MediaControlReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.zerolink.action.MEDIA_CONTROL" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

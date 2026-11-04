@@ -12,6 +12,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.zerolink.ZeroLinkService
 import org.zerolink.jni.ZeroLinkNative
+import org.zerolink.notifications.CachedReplyAction
+import org.zerolink.notifications.NotificationActionCache
 
 class ZeroNotificationListener : NotificationListenerService() {
 
@@ -19,6 +21,24 @@ class ZeroNotificationListener : NotificationListenerService() {
         private const val TAG = "ZeroLink.NotificationListener"
         const val PACKET_TYPE_NOTIFICATION = 0x03
         private const val DEBOUNCE_DELAY_MS = 100L
+
+        @Volatile
+        private var instance: ZeroNotificationListener? = null
+
+        /**
+         * Cancels a remote notification by its StatusBarNotification key.
+         * Safe to call when the listener is not connected.
+         */
+        fun cancelNotificationByKey(key: String): Boolean {
+            val listener = instance ?: return false
+            return try {
+                listener.cancelNotification(key)
+                true
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to cancel notification $key: ${e.message}")
+                false
+            }
+        }
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + Job())
@@ -26,6 +46,7 @@ class ZeroNotificationListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        instance = this
         Log.i(TAG, "ZeroNotificationListener connected and active")
     }
 
@@ -49,6 +70,7 @@ class ZeroNotificationListener : NotificationListenerService() {
         val packageName = sbn.packageName
         if (packageName == applicationContext.packageName) return
         debounceJobs.remove(sbn.key)?.cancel()
+        NotificationActionCache.remove(sbn.key)
     }
 
     private fun dispatchNotification(sbn: StatusBarNotification) {
@@ -62,6 +84,8 @@ class ZeroNotificationListener : NotificationListenerService() {
         if (title.isBlank() && text.isBlank()) {
             return
         }
+
+        cacheReplyAction(sbn)
 
         val packageName = sbn.packageName
         val appName = try {
@@ -87,7 +111,29 @@ class ZeroNotificationListener : NotificationListenerService() {
         ZeroLinkService.instance?.sendPacket(PACKET_TYPE_NOTIFICATION, serialized)
     }
 
+    /**
+     * Caches the first notification action that supports free-form RemoteInput so
+     * Windows inline replies can be delivered back to the originating app.
+     */
+    private fun cacheReplyAction(sbn: StatusBarNotification) {
+        val actions = sbn.notification.actions ?: return
+        for (action in actions) {
+            val remoteInputs = action.remoteInputs ?: continue
+            if (remoteInputs.isEmpty()) continue
+            if (remoteInputs.none { it.allowFreeFormInput }) continue
+            val pendingIntent = action.actionIntent ?: continue
+            NotificationActionCache.put(
+                sbn.key,
+                CachedReplyAction(pendingIntent, remoteInputs)
+            )
+            return
+        }
+    }
+
     override fun onDestroy() {
+        if (instance === this) {
+            instance = null
+        }
         debounceJobs.values.forEach { it.cancel() }
         debounceJobs.clear()
         super.onDestroy()

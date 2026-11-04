@@ -1,6 +1,7 @@
 package org.zerolink
 
 import android.app.Notification
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
@@ -22,10 +23,16 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.zerolink.ble.L2capServer
+import org.zerolink.clipboard.ZeroAccessibilityService
 import org.zerolink.clipboard.ZeroClipboardManager
 import org.zerolink.media.H265ScreenEncoder
+import org.zerolink.media.MediaControlReceiver
 import org.zerolink.network.NetworkTransportBridge
+import org.zerolink.notifications.NotificationActionCache
+import org.zerolink.notifications.ZeroNotificationListener
 import org.zerolink.protocol.CatalogItem
+import org.zerolink.protocol.MediaCommand
+import org.zerolink.protocol.MediaState
 import org.zerolink.protocol.ZeroLinkProtocol
 import org.zerolink.wifi.EphemeralWifiManager
 import java.nio.ByteBuffer
@@ -37,6 +44,11 @@ class ZeroLinkService : Service() {
     companion object {
         private const val TAG = "ZeroLink.Service"
         private const val NOTIFICATION_ID = 1001
+
+        private const val PACKET_TYPE_NOTIFICATION_ACTION = 0x0B
+        private const val PACKET_TYPE_MEDIA_CONTROL = 0x0C
+        private const val PACKET_TYPE_SCREEN_INPUT = 0x0D
+        private const val PACKET_TYPE_MEDIA_STATE = 0x0E
 
         @Volatile
         var instance: ZeroLinkService? = null
@@ -55,6 +67,8 @@ class ZeroLinkService : Service() {
     private var heartbeatJob: Job? = null
     private var screenEncoder: H265ScreenEncoder? = null
     private val screenFrameSeq = AtomicLong(0)
+    private var currentMediaState: MediaState? = null
+    private lateinit var notificationManager: NotificationManager
 
     val isScreenMirroringActive: Boolean
         get() = screenEncoder?.isRunning == true
@@ -94,6 +108,22 @@ class ZeroLinkService : Service() {
     }
 
     private fun startForegroundNotification() {
+        notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+        val notification: Notification = buildNotification(currentMediaState)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun buildNotification(media: MediaState?): Notification {
         val notificationIntent = packageManager.getLaunchIntentForPackage(packageName)
         val pendingIntent = if (notificationIntent != null) {
             PendingIntent.getActivity(
@@ -114,24 +144,60 @@ class ZeroLinkService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val notification: Notification = NotificationCompat.Builder(this, ZeroLinkApplication.CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, ZeroLinkApplication.CHANNEL_ID)
             .setContentTitle("ZeroLink Active")
-            .setContentText("Ultra-low-power BLE standby")
+            .setContentText(
+                if (media != null && media.title.isNotBlank()) {
+                    listOf(media.title, media.artist).filter { it.isNotBlank() }.joinToString(" — ")
+                } else {
+                    "Ultra-low-power BLE standby"
+                }
+            )
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(pendingIntent)
+            .setOnlyAlertOnce(true)
             .addAction(android.R.drawable.ic_menu_send, "📋 Sync Clipboard", syncClipboardPendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN) // Minimize battery impact
-            .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        if (media != null) {
+            builder.addAction(
+                android.R.drawable.ic_media_previous,
+                "Previous",
+                mediaActionPendingIntent(10, MediaCommand.PREVIOUS)
             )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+            builder.addAction(
+                if (media.isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+                if (media.isPlaying) "Pause" else "Play",
+                mediaActionPendingIntent(11, MediaCommand.TOGGLE_PLAY_PAUSE)
+            )
+            builder.addAction(
+                android.R.drawable.ic_media_next,
+                "Next",
+                mediaActionPendingIntent(12, MediaCommand.NEXT)
+            )
+        }
+
+        return builder.build()
+    }
+
+    private fun mediaActionPendingIntent(requestCode: Int, command: Int): PendingIntent {
+        val intent = Intent(this, MediaControlReceiver::class.java).apply {
+            action = MediaControlReceiver.ACTION_MEDIA_CONTROL
+            putExtra(MediaControlReceiver.EXTRA_COMMAND, command)
+        }
+        return PendingIntent.getBroadcast(
+            this,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+    }
+
+    fun updateMediaNotification(state: MediaState?) {
+        currentMediaState = state
+        if (::notificationManager.isInitialized) {
+            notificationManager.notify(NOTIFICATION_ID, buildNotification(state))
         }
     }
 
@@ -193,6 +259,17 @@ class ZeroLinkService : Service() {
             }
             sent
         } else false
+    }
+
+    fun sendMediaCommand(command: Int): Boolean {
+        val payload = ZeroLinkProtocol.serializeMediaControl(command)
+        val sent = sendPacket(PACKET_TYPE_MEDIA_CONTROL, payload)
+        if (sent) {
+            MainActivity.appendLogStatic("🎵 Media command sent to PC: $command")
+        } else {
+            MainActivity.appendLogStatic("⚠️ Media command failed (PC not connected)")
+        }
+        return sent
     }
 
     fun sendTestNotification(
@@ -311,6 +388,53 @@ class ZeroLinkService : Service() {
                     }
                 }
             }
+            PACKET_TYPE_NOTIFICATION_ACTION -> {
+                val action = ZeroLinkProtocol.deserializeNotificationAction(payload)
+                if (action != null) {
+                    when (action.actionId) {
+                        "reply" -> {
+                            val delivered = NotificationActionCache.sendReply(
+                                this,
+                                action.notificationId,
+                                action.replyText
+                            )
+                            val log = if (delivered) {
+                                "💬 Inline reply delivered to Android: '${action.replyText}'"
+                            } else {
+                                "⚠️ Reply action expired for ${action.notificationId}"
+                            }
+                            MainActivity.appendLogStatic(log)
+                        }
+                        "dismiss" -> {
+                            val dismissed = ZeroNotificationListener.cancelNotificationByKey(action.notificationId)
+                            NotificationActionCache.remove(action.notificationId)
+                            MainActivity.appendLogStatic(
+                                if (dismissed) "🔕 Notification dismissed from Windows" else "⚠️ Could not dismiss notification"
+                            )
+                        }
+                        else -> Log.d(TAG, "Unhandled notification action: ${action.actionId}")
+                    }
+                }
+            }
+            PACKET_TYPE_MEDIA_STATE -> {
+                val state = ZeroLinkProtocol.deserializeMediaState(payload)
+                if (state != null) {
+                    Log.i(TAG, "Media state from PC: ${state.title} — ${state.artist} (playing=${state.isPlaying})")
+                    MainActivity.appendLogStatic(
+                        "🎵 Now playing on PC: ${state.title} — ${state.artist}"
+                    )
+                    MainActivity.updateMediaStateStatic(state)
+                    updateMediaNotification(state)
+                }
+            }
+            PACKET_TYPE_SCREEN_INPUT -> {
+                val a11y = ZeroAccessibilityService.instance
+                if (a11y != null) {
+                    a11y.handleRemoteInput(payload)
+                } else {
+                    Log.w(TAG, "Screen input received but accessibility service is not connected")
+                }
+            }
             L2capServer.PACKET_TYPE_WIFI_WAKE -> {
                 Log.i(TAG, "Received Magic Packet: Waking ephemeral Wi-Fi socket")
                 MainActivity.appendLogStatic("⚡ Received Wi-Fi Wake Request from Windows")
@@ -346,6 +470,7 @@ class ZeroLinkService : Service() {
         Log.i(TAG, "ZeroLinkService destroying...")
         stopScreenMirroring()
         heartbeatJob?.cancel()
+        NotificationActionCache.clear()
         clipboardManager.stop()
         if (::l2capServer.isInitialized) {
             l2capServer.stop()
