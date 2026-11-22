@@ -31,7 +31,7 @@ class ClipboardActionReceiver : BroadcastReceiver() {
                     service.clipboardManager.syncClipboardNow()
                 }
                 Toast.makeText(context, "📋 Clipboard synced to PC!", Toast.LENGTH_SHORT).show()
-                MainActivity.appendLogStatic("📋 Clipboard synced to PC: '${textToCopy ?: "(primary clip)"}'")
+                MainActivity.appendLogStatic("📋 Clipboard synced to PC")
             } else {
                 Toast.makeText(context, "⚠️ ZeroLink service is not running", Toast.LENGTH_SHORT).show()
             }

@@ -2,18 +2,23 @@ use byteorder::{BigEndian, ByteOrder};
 
 use crate::error::{Result, ZeroLinkError};
 
+/// Handshake/key-schedule version. Bumped when directional keys and key confirmation were added.
+pub const HANDSHAKE_PROTOCOL_VERSION: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeInitPayload {
     pub client_ephemeral_pubkey: [u8; 32],
     pub salt: [u8; 32],
     pub protocol_version: u32,
     pub client_device_name: String,
+    /// Zero when unpaired; otherwise an HMAC proof under the stored pairing secret.
+    pub pairing_auth_tag: [u8; 16],
 }
 
 impl HandshakeInitPayload {
     pub fn serialize(&self) -> Vec<u8> {
         let name_bytes = self.client_device_name.as_bytes();
-        let mut out = Vec::with_capacity(32 + 32 + 4 + 4 + name_bytes.len());
+        let mut out = Vec::with_capacity(32 + 32 + 4 + 4 + name_bytes.len() + 16);
         out.extend_from_slice(&self.client_ephemeral_pubkey);
         out.extend_from_slice(&self.salt);
         let mut ver_buf = [0u8; 4];
@@ -24,13 +29,14 @@ impl HandshakeInitPayload {
         BigEndian::write_u32(&mut len_buf, name_bytes.len() as u32);
         out.extend_from_slice(&len_buf);
         out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&self.pairing_auth_tag);
         out
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 72 {
+        if buf.len() < 88 {
             return Err(ZeroLinkError::IncompleteFrame {
-                needed: 72,
+                needed: 88,
                 available: buf.len(),
             });
         }
@@ -41,19 +47,33 @@ impl HandshakeInitPayload {
         let protocol_version = BigEndian::read_u32(&buf[64..68]);
         let name_len = BigEndian::read_u32(&buf[68..72]) as usize;
 
-        if buf.len() < 72 + name_len {
+        let expected_len = 72usize
+            .checked_add(name_len)
+            .and_then(|len| len.checked_add(16))
+            .ok_or_else(|| {
+                ZeroLinkError::SerializationError("HandshakeInit length overflow".into())
+            })?;
+        if buf.len() < expected_len {
             return Err(ZeroLinkError::IncompleteFrame {
-                needed: 72 + name_len,
+                needed: expected_len,
                 available: buf.len(),
             });
         }
+        if buf.len() != expected_len {
+            return Err(ZeroLinkError::SerializationError(
+                "HandshakeInit has trailing bytes".into(),
+            ));
+        }
         let client_device_name = String::from_utf8_lossy(&buf[72..72 + name_len]).to_string();
+        let mut pairing_auth_tag = [0u8; 16];
+        pairing_auth_tag.copy_from_slice(&buf[72 + name_len..72 + name_len + 16]);
 
         Ok(Self {
             client_ephemeral_pubkey,
             salt,
             protocol_version,
             client_device_name,
+            pairing_auth_tag,
         })
     }
 }
@@ -64,12 +84,14 @@ pub struct HandshakeReplyPayload {
     pub auth_tag: [u8; 16],
     pub l2cap_psm: u16,
     pub server_device_name: String,
+    /// Zero when unpaired; otherwise an HMAC proof under the stored pairing secret.
+    pub pairing_auth_tag: [u8; 16],
 }
 
 impl HandshakeReplyPayload {
     pub fn serialize(&self) -> Vec<u8> {
         let name_bytes = self.server_device_name.as_bytes();
-        let mut out = Vec::with_capacity(32 + 16 + 2 + 4 + name_bytes.len());
+        let mut out = Vec::with_capacity(32 + 16 + 2 + 4 + name_bytes.len() + 16);
         out.extend_from_slice(&self.server_ephemeral_pubkey);
         out.extend_from_slice(&self.auth_tag);
         let mut psm_buf = [0u8; 2];
@@ -80,13 +102,14 @@ impl HandshakeReplyPayload {
         BigEndian::write_u32(&mut len_buf, name_bytes.len() as u32);
         out.extend_from_slice(&len_buf);
         out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&self.pairing_auth_tag);
         out
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 54 {
+        if buf.len() < 70 {
             return Err(ZeroLinkError::IncompleteFrame {
-                needed: 54,
+                needed: 70,
                 available: buf.len(),
             });
         }
@@ -97,19 +120,33 @@ impl HandshakeReplyPayload {
         let l2cap_psm = BigEndian::read_u16(&buf[48..50]);
         let name_len = BigEndian::read_u32(&buf[50..54]) as usize;
 
-        if buf.len() < 54 + name_len {
+        let expected_len = 54usize
+            .checked_add(name_len)
+            .and_then(|len| len.checked_add(16))
+            .ok_or_else(|| {
+                ZeroLinkError::SerializationError("HandshakeReply length overflow".into())
+            })?;
+        if buf.len() < expected_len {
             return Err(ZeroLinkError::IncompleteFrame {
-                needed: 54 + name_len,
+                needed: expected_len,
                 available: buf.len(),
             });
         }
+        if buf.len() != expected_len {
+            return Err(ZeroLinkError::SerializationError(
+                "HandshakeReply has trailing bytes".into(),
+            ));
+        }
         let server_device_name = String::from_utf8_lossy(&buf[54..54 + name_len]).to_string();
+        let mut pairing_auth_tag = [0u8; 16];
+        pairing_auth_tag.copy_from_slice(&buf[54 + name_len..54 + name_len + 16]);
 
         Ok(Self {
             server_ephemeral_pubkey,
             auth_tag,
             l2cap_psm,
             server_device_name,
+            pairing_auth_tag,
         })
     }
 }
@@ -757,7 +794,10 @@ impl FileCatalog {
             offset += item_len;
         }
 
-        Ok(Self { sync_root_id, files })
+        Ok(Self {
+            sync_root_id,
+            files,
+        })
     }
 }
 
@@ -959,7 +999,11 @@ impl ScreenControlRequest {
             1 => ScreenAction::Stop,
             2 => ScreenAction::RequestKeyframe,
             3 => ScreenAction::SetBitrate,
-            _ => return Err(ZeroLinkError::SerializationError("Invalid screen action".into())),
+            _ => {
+                return Err(ZeroLinkError::SerializationError(
+                    "Invalid screen action".into(),
+                ))
+            }
         };
         let width = BigEndian::read_u32(&buf[1..5]);
         let height = BigEndian::read_u32(&buf[5..9]);
@@ -983,11 +1027,13 @@ pub struct VideoFrameHeader {
     pub is_keyframe: bool,
     pub nal_unit_count: u16,
     pub frame_size_bytes: u32,
+    pub width: u16,
+    pub height: u16,
 }
 
 impl VideoFrameHeader {
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(23);
+        let mut out = Vec::with_capacity(27);
         let mut u64_buf = [0u8; 8];
         BigEndian::write_u64(&mut u64_buf, self.sequence_number);
         out.extend_from_slice(&u64_buf);
@@ -1002,13 +1048,18 @@ impl VideoFrameHeader {
         let mut u32_buf = [0u8; 4];
         BigEndian::write_u32(&mut u32_buf, self.frame_size_bytes);
         out.extend_from_slice(&u32_buf);
+        let mut u16_buf = [0u8; 2];
+        BigEndian::write_u16(&mut u16_buf, self.width);
+        out.extend_from_slice(&u16_buf);
+        BigEndian::write_u16(&mut u16_buf, self.height);
+        out.extend_from_slice(&u16_buf);
         out
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
-        if buf.len() < 23 {
+        if buf.len() < 27 {
             return Err(ZeroLinkError::IncompleteFrame {
-                needed: 23,
+                needed: 27,
                 available: buf.len(),
             });
         }
@@ -1017,6 +1068,8 @@ impl VideoFrameHeader {
         let is_keyframe = buf[16] != 0;
         let nal_unit_count = BigEndian::read_u16(&buf[17..19]);
         let frame_size_bytes = BigEndian::read_u32(&buf[19..23]);
+        let width = BigEndian::read_u16(&buf[23..25]);
+        let height = BigEndian::read_u16(&buf[25..27]);
 
         Ok(Self {
             sequence_number,
@@ -1024,6 +1077,8 @@ impl VideoFrameHeader {
             is_keyframe,
             nal_unit_count,
             frame_size_bytes,
+            width,
+            height,
         })
     }
 }
@@ -1033,7 +1088,7 @@ pub struct Heartbeat {
     pub battery_percentage: u8,
     pub is_charging: bool,
     pub wifi_connected: bool,
-    pub quic_port_active: u16,
+    pub bulk_port_active: u16,
     pub device_power_mode: u8,
 }
 
@@ -1044,7 +1099,7 @@ impl Heartbeat {
         out.push(if self.is_charging { 1 } else { 0 });
         out.push(if self.wifi_connected { 1 } else { 0 });
         let mut port_b = [0u8; 2];
-        BigEndian::write_u16(&mut port_b, self.quic_port_active);
+        BigEndian::write_u16(&mut port_b, self.bulk_port_active);
         out.extend_from_slice(&port_b);
         out.push(self.device_power_mode);
         out
@@ -1060,14 +1115,14 @@ impl Heartbeat {
         let battery_percentage = buf[0];
         let is_charging = buf[1] != 0;
         let wifi_connected = buf[2] != 0;
-        let quic_port_active = BigEndian::read_u16(&buf[3..5]);
+        let bulk_port_active = BigEndian::read_u16(&buf[3..5]);
         let device_power_mode = buf[5];
 
         Ok(Self {
             battery_percentage,
             is_charging,
             wifi_connected,
-            quic_port_active,
+            bulk_port_active,
             device_power_mode,
         })
     }
@@ -1082,22 +1137,30 @@ mod tests {
         let init = HandshakeInitPayload {
             client_ephemeral_pubkey: [7u8; 32],
             salt: [42u8; 32],
-            protocol_version: 1,
+            protocol_version: HANDSHAKE_PROTOCOL_VERSION,
             client_device_name: "Desktop-PC".to_string(),
+            pairing_auth_tag: [0u8; 16],
         };
         let b = init.serialize();
         let parsed = HandshakeInitPayload::deserialize(&b).unwrap();
         assert_eq!(init, parsed);
+        let mut init_with_trailing_byte = b.clone();
+        init_with_trailing_byte.push(0);
+        assert!(HandshakeInitPayload::deserialize(&init_with_trailing_byte).is_err());
 
         let reply = HandshakeReplyPayload {
             server_ephemeral_pubkey: [9u8; 32],
             auth_tag: [12u8; 16],
             l2cap_psm: 0x1001,
             server_device_name: "Pixel-Phone".to_string(),
+            pairing_auth_tag: [0u8; 16],
         };
         let b_reply = reply.serialize();
         let parsed_reply = HandshakeReplyPayload::deserialize(&b_reply).unwrap();
         assert_eq!(reply, parsed_reply);
+        let mut reply_with_trailing_byte = b_reply.clone();
+        reply_with_trailing_byte.push(0);
+        assert!(HandshakeReplyPayload::deserialize(&reply_with_trailing_byte).is_err());
     }
 
     #[test]
@@ -1266,6 +1329,8 @@ mod tests {
             is_keyframe: true,
             nal_unit_count: 2,
             frame_size_bytes: 45_120,
+            width: 1080,
+            height: 2400,
         };
         let b_frame = frame.serialize();
         let parsed_frame = VideoFrameHeader::deserialize(&b_frame).unwrap();
@@ -1275,7 +1340,7 @@ mod tests {
             battery_percentage: 87,
             is_charging: false,
             wifi_connected: true,
-            quic_port_active: 8443,
+            bulk_port_active: 8443,
             device_power_mode: 0,
         };
         let b_hb = hb.serialize();

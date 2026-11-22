@@ -2,12 +2,66 @@ use jni::objects::{JByteArray, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jlong};
 use jni::JNIEnv;
 use std::sync::Mutex;
-use zerolink_core::crypto::{KeyExchange, SessionCipher};
+use zerolink_core::crypto::{KeyExchange, SessionCipher, SessionRole};
 use zerolink_core::framing::{Frame, PacketType};
 use zerolink_core::protocol::{ClipboardPayload, ClipboardType, NotificationPayload};
 
 static SERVER_KX: Mutex<Option<KeyExchange>> = Mutex::new(None);
 static SESSION_CIPHER: Mutex<Option<SessionCipher>> = Mutex::new(None);
+
+#[no_mangle]
+pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_pairingCode(
+    env: JNIEnv,
+    _class: JClass,
+    client_pub_bytes: JByteArray,
+    salt_bytes: JByteArray,
+    server_pub_bytes: JByteArray,
+) -> jni::sys::jstring {
+    let client = match env.convert_byte_array(&client_pub_bytes) {
+        Ok(v) if v.len() == 32 => v,
+        _ => return std::ptr::null_mut(),
+    };
+    let salt = match env.convert_byte_array(&salt_bytes) {
+        Ok(v) if v.len() == 32 => v,
+        _ => return std::ptr::null_mut(),
+    };
+    let server = match env.convert_byte_array(&server_pub_bytes) {
+        Ok(v) if v.len() == 32 => v,
+        _ => return std::ptr::null_mut(),
+    };
+    let client: [u8; 32] = client.try_into().expect("length checked");
+    let salt: [u8; 32] = salt.try_into().expect("length checked");
+    let server: [u8; 32] = server.try_into().expect("length checked");
+    let code = zerolink_core::crypto::pairing_code(&client, &salt, &server);
+    match env.new_string(code) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_deriveWifiBulkKeys(
+    env: JNIEnv,
+    _class: JClass,
+    session_token: JByteArray,
+    server_challenge: JByteArray,
+) -> jbyteArray {
+    let token = match env.convert_byte_array(&session_token) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => return std::ptr::null_mut(),
+    };
+    let challenge = match env.convert_byte_array(&server_challenge) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => return std::ptr::null_mut(),
+    };
+    let token: [u8; 32] = token.try_into().expect("length checked");
+    let challenge: [u8; 32] = challenge.try_into().expect("length checked");
+    let keys = zerolink_core::crypto::derive_wifi_bulk_keys(&token, &challenge);
+    match env.byte_array_from_slice(&keys) {
+        Ok(array) => array.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_generateServerEphemeralKey(
@@ -63,7 +117,7 @@ pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_completeHandshake(
         None => return 0,
     };
 
-    match kx.complete_handshake(&client_arr, &salt_arr) {
+    match kx.complete_handshake(&client_arr, &salt_arr, SessionRole::Responder) {
         Ok(cipher) => {
             let mut cipher_lock = match SESSION_CIPHER.lock() {
                 Ok(l) => l,
@@ -73,6 +127,50 @@ pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_completeHandshake(
             1
         }
         Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_keyConfirmationTag(
+    env: JNIEnv,
+    _class: JClass,
+    transcript_bytes: JByteArray,
+) -> jbyteArray {
+    let transcript = match env.convert_byte_array(&transcript_bytes) {
+        Ok(v) => v,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let lock = match SESSION_CIPHER.lock() {
+        Ok(l) => l,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let cipher = match lock.as_ref() {
+        Some(c) => c,
+        None => return std::ptr::null_mut(),
+    };
+    let tag = cipher.key_confirmation_tag(&transcript);
+    match env.byte_array_from_slice(&tag) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_pairingSecret(
+    env: JNIEnv,
+    _class: JClass,
+) -> jbyteArray {
+    let lock = match SESSION_CIPHER.lock() {
+        Ok(l) => l,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let secret = match lock.as_ref() {
+        Some(cipher) => cipher.pairing_secret(),
+        None => return std::ptr::null_mut(),
+    };
+    match env.byte_array_from_slice(&secret) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 
@@ -174,27 +272,27 @@ pub extern "system" fn Java_org_zerolink_jni_ZeroLinkNative_serializeNotificatio
     let id_str: String = env
         .get_string(&id)
         .ok()
-        .map(|s| String::from(s))
+        .map(String::from)
         .unwrap_or_default();
     let pkg_str: String = env
         .get_string(&package_name)
         .ok()
-        .map(|s| String::from(s))
+        .map(String::from)
         .unwrap_or_default();
     let app_str: String = env
         .get_string(&app_name)
         .ok()
-        .map(|s| String::from(s))
+        .map(String::from)
         .unwrap_or_default();
     let title_str: String = env
         .get_string(&title)
         .ok()
-        .map(|s| String::from(s))
+        .map(String::from)
         .unwrap_or_default();
     let content_str: String = env
         .get_string(&content)
         .ok()
-        .map(|s| String::from(s))
+        .map(String::from)
         .unwrap_or_default();
 
     let notif = NotificationPayload {

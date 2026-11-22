@@ -35,6 +35,13 @@ data class ScreenInput(
     val scrollDelta: Int
 )
 
+data class WifiWakePayload(
+    val targetIp: String,
+    val port: Int,
+    val sessionToken: String,
+    val reason: String
+)
+
 object MediaCommand {
     const val PLAY = 0
     const val PAUSE = 1
@@ -46,6 +53,46 @@ object MediaCommand {
 }
 
 object ZeroLinkProtocol {
+    fun serializeWifiWake(payload: WifiWakePayload): ByteArray {
+        val fields = listOf(payload.targetIp, payload.sessionToken, payload.reason)
+            .map { it.toByteArray(Charsets.UTF_8) }
+        require(payload.port in 1..65535 && fields.all { it.size <= 0xffff })
+        require(isValidBulkSessionToken(payload.sessionToken))
+        val result = ByteBuffer.allocate(2 + fields.sumOf { 2 + it.size }).order(ByteOrder.BIG_ENDIAN)
+        result.putShort(payload.port.toShort())
+        fields.forEach { field ->
+            result.putShort(field.size.toShort())
+            result.put(field)
+        }
+        return result.array()
+    }
+
+    fun deserializeWifiWake(payload: ByteArray): WifiWakePayload? {
+        return try {
+            val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+            if (buffer.remaining() < 2) return null
+            val port = buffer.short.toInt() and 0xffff
+            fun readString(): String? {
+                if (buffer.remaining() < 2) return null
+                val length = buffer.short.toInt() and 0xffff
+                if (buffer.remaining() < length) return null
+                val bytes = ByteArray(length)
+                buffer.get(bytes)
+                return bytes.toString(Charsets.UTF_8)
+            }
+            val targetIp = readString() ?: return null
+            val sessionToken = readString() ?: return null
+            val reason = readString() ?: return null
+            if (buffer.hasRemaining() || port == 0 || !isValidBulkSessionToken(sessionToken)) return null
+            WifiWakePayload(targetIp, port, sessionToken, reason)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun isValidBulkSessionToken(value: String): Boolean =
+        value.length == 64 && value.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+
 
     /**
      * Serializes Android Heartbeat telemetry into the 6-byte binary payload format expected by Windows.
@@ -54,14 +101,14 @@ object ZeroLinkProtocol {
         batteryPercentage: Int,
         isCharging: Boolean,
         wifiConnected: Boolean = true,
-        quicPort: Int = 8443,
+        bulkPort: Int = 8443,
         devicePowerMode: Int = 0
     ): ByteArray {
         val buf = ByteBuffer.allocate(6).order(ByteOrder.BIG_ENDIAN)
         buf.put(batteryPercentage.coerceIn(0, 100).toByte())
         buf.put(if (isCharging) 1.toByte() else 0.toByte())
         buf.put(if (wifiConnected) 1.toByte() else 0.toByte())
-        buf.putShort(quicPort.toShort())
+        buf.putShort(bulkPort.toShort())
         buf.put(devicePowerMode.toByte())
         return buf.array()
     }
@@ -106,24 +153,28 @@ object ZeroLinkProtocol {
     }
 
     /**
-     * Serializes a VideoFrameHeader (23 bytes) prepended to HEVC NAL data.
+     * Serializes a VideoFrameHeader (27 bytes) with encoder dimensions, prepended to HEVC NAL data.
      */
     fun serializeScreenFrame(
         sequence: Long,
         ptsUs: Long,
         isKeyframe: Boolean,
-        nalData: ByteArray
+        nalData: ByteArray,
+        width: Int,
+        height: Int
     ): ByteArray {
-        val headerBuf = ByteBuffer.allocate(23).order(ByteOrder.BIG_ENDIAN)
+        val headerBuf = ByteBuffer.allocate(27).order(ByteOrder.BIG_ENDIAN)
         headerBuf.putLong(sequence)
         headerBuf.putLong(ptsUs)
         headerBuf.put(if (isKeyframe) 1.toByte() else 0.toByte())
         headerBuf.putShort(1.toShort()) // nal_unit_count
         headerBuf.putInt(nalData.size)
+        headerBuf.putShort(width.coerceIn(1, 65535).toShort())
+        headerBuf.putShort(height.coerceIn(1, 65535).toShort())
 
-        val payload = ByteArray(23 + nalData.size)
-        System.arraycopy(headerBuf.array(), 0, payload, 0, 23)
-        System.arraycopy(nalData, 0, payload, 23, nalData.size)
+        val payload = ByteArray(27 + nalData.size)
+        System.arraycopy(headerBuf.array(), 0, payload, 0, 27)
+        System.arraycopy(nalData, 0, payload, 27, nalData.size)
         return payload
     }
 

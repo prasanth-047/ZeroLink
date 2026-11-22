@@ -8,7 +8,9 @@ pub enum ZeroLinkError {
     #[error("Unsupported protocol version: {0}")]
     UnsupportedVersion(u8),
 
-    #[error("Header CRC32 checksum mismatch: expected {expected:#010x}, calculated {calculated:#010x}")]
+    #[error(
+        "Header CRC32 checksum mismatch: expected {expected:#010x}, calculated {calculated:#010x}"
+    )]
     HeaderChecksumMismatch { expected: u32, calculated: u32 },
 
     #[error("Frame length exceeds maximum allowed buffer size: {0} bytes")]

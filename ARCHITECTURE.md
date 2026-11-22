@@ -8,16 +8,16 @@
 
 ZeroLink is an ultra-low-power, zero-overhead device integration fabric between Android and Microsoft Windows. Unlike legacy bridges (e.g. Microsoft Phone Link, KDE Connect) that rely on persistent Wi-Fi TCP sockets, heavy background runtimes, Electron wrappers, and high polling rates, ZeroLink is architected around:
 
-1. **Dual-Radio State Machine:** Sub-2mA Bluetooth Low Energy (BLE) L2CAP Connection-Oriented Channels (CoC) for continuous control, signaling, and small payloads; combined with on-demand, ephemeral Wi-Fi QUIC sockets for bulk data (photos, files, screen mirroring).
+1. **Dual-Radio State Machine:** BLE L2CAP CoC or the paired TCP bridge carries control and small payloads; an on-demand Wi-Fi TCP socket carries photo ranges. The bulk socket uses challenge-bound AES-GCM keys derived from a one-time token delivered over the paired encrypted channel.
 2. **Zero-Copy Memory Model:** Rust core paired with FlatBuffers binary serialization. Eliminates JSON deserialization overhead, GC pauses, and heap allocations in hot paths.
 3. **Native OS Surface:** Windows daemon operates via raw Win32 message pumps (`WM_CLIPBOARDUPDATE`), WinRT `ToastNotificationManager`, and the Windows Cloud Filter API (`cldapi.dll`). Android layer operates via event-driven `NotificationListenerService`, native JNI bindings, and hardware `MediaCodec`.
 
-### Verified Target Metrics
+### Design Targets (Not Independently Reproduced in This Review)
 | Metric | Target | Design Mechanism |
 | :--- | :--- | :--- |
 | **Android Battery Drain** | 1.0% – 2.0% / 24h (5000 mAh) | Zero wake locks; radio sleeps in Doze mode; L2CAP interrupt-driven |
 | **Android Power Budget** | < 100 mAh / day | BLE CoC slave latency = 45–60 intervals; radio duty cycle < 0.2% |
-| **Windows RAM Footprint**| < 15 MB Working Set | Headless Rust daemon; static dispatch; no CEF/Webview runtime |
+| **Windows RAM Footprint**| Target < 15 MB working set | No CEF/WebView runtime; three isolated 8-second no-peer idle snapshots from `scripts/measure_zerolink_memory.ps1` after the delayed startup trim measured 14.25–14.26 MB working set and 3.11–3.35 MB private memory. Connected-session and Android Doze measurements remain open. |
 | **Windows Idle CPU** | 0.0% – 0.1% | `GetMessageW` on hidden message-only window; zero polling timers |
 | **Screen Mirror Latency**| < 35 ms end-to-end | Hardware H.265/HEVC encode/decode with dynamic 0–60 FPS throttling |
 
@@ -67,8 +67,10 @@ zerolink/
         ├── clipboard.rs            # WM_CLIPBOARDUPDATE listener & injector
         ├── notifications.rs        # Native WinRT Toast notifications
         ├── cloud_filter.rs         # Cloud Filter API (cldapi.dll) virtual drive
-        ├── quic_client.rs          # Ephemeral QUIC client for bulk fetch
-        └── screen_viewer.rs        # D3D11 / DXVA2 H.265 hardware decoder
+        ├── bulk_client.rs          # Ephemeral encrypted TCP client for photo ranges
+        ├── hevc_decoder.rs         # D3D11-aware async Media Foundation decode + software fallback
+        ├── d3d_presenter.rs        # D3D11 NV12 video processing and swap-chain presentation
+        └── screen_viewer.rs        # Native D3D11/GDI frame viewer and normalized remote input window
 ```
 
 ---
@@ -83,32 +85,32 @@ stateDiagram-v2
         Standby_Disconnected --> BLE_Advertising: Android starts advertising
         BLE_Advertising --> BLE_Connected_L2CAP: Windows initiates L2CAP CoC connection
         BLE_Connected_L2CAP --> ECDH_Handshake: Exchange ephemeral public keys
-        ECDH_Handshake --> Authenticated_Session: Derive AES-GCM session key via HKDF
-        Authenticated_Session --> Idle_Low_Power: L2CAP idle (0.0% CPU, <2mA)
+        ECDH_Handshake --> Pairing_Approval: New peer; compare code and approve both sides
+        Pairing_Approval --> Authenticated_Session: Encrypted pairing acknowledgement
+        ECDH_Handshake --> Authenticated_Session: Existing PSK proofs verified
+        Authenticated_Session --> Idle_Low_Power: Session is ready for data
         Idle_Low_Power --> Signaling_Event: Clip update / Notification
         Signaling_Event --> Idle_Low_Power: Ack received
     }
 
     state Ephemeral_WiFi_Domain {
         Idle_Low_Power --> WiFi_Waking: BLE Magic Packet "WAKE_WIFI"
-        WiFi_Waking --> WiFi_Direct_Established: Ephemeral AP/LAN QUIC Socket (AES-GCM)
+        WiFi_Waking --> WiFi_Direct_Established: Ephemeral local TCP socket (challenge-bound AES-GCM)
         WiFi_Direct_Established --> Bulk_Data_Transfer: Stream photo/file chunks or H.265
         Bulk_Data_Transfer --> WiFi_Teardown: Transfer complete or session exit
-        WiFi_Teardown --> Idle_Low_Power: Wi-Fi radio immediately shutdown
+        WiFi_Teardown --> Idle_Low_Power: Restore Wi-Fi to its prior state
     }
 ```
 
 ### 3.1 ECDH Secure Handshake (Curve25519 + HKDF + AES-256-GCM)
 1. **Key Generation:** Both Windows client and Android host generate an ephemeral X25519 keypair ($sk_w, pk_w$) and ($sk_a, pk_a$).
 2. **Key Exchange (Framed L2CAP packet):**
-   - Windows sends `HandshakeInit { client_ephemeral_pubkey: [u8; 32], salt: [u8; 32] }`.
-   - Android computes shared secret $S = \text{X25519}(sk_a, pk_w)$.
-   - Android sends `HandshakeReply { server_ephemeral_pubkey: [u8; 32], auth_tag: [u8; 16] }`.
-3. **Session Key Derivation:**
-   $$\text{PRK} = \text{HKDF-Extract}(\text{salt}, S)$$
-   $$\text{SessionKey} = \text{HKDF-Expand}(\text{PRK}, \text{"ZeroLink-v1-AES-GCM-Key"}, 32)$$
-   $$\text{IV\_Base} = \text{HKDF-Expand}(\text{PRK}, \text{"ZeroLink-v1-IV"}, 12)$$
-4. **Counter Nonce:** Each directional packet increments a 64-bit sequence counter XORed into `IV_Base`. Replay attacks are rejected strictly by monotonic sequence verification.
+   - Windows sends `HandshakeInit { client_ephemeral_pubkey, salt, protocol_version: 3, client_device_name, pairing_auth_tag }`. The tag is zero for a new pairing; otherwise it is a role-labeled HMAC under the saved pairing secret.
+   - Android validates the client proof when paired, computes shared secret $S = \text{X25519}(sk_a, pk_w)$, and returns `HandshakeReply { server_ephemeral_pubkey, auth_tag, l2cap_psm, server_device_name, pairing_auth_tag }`. Both parsers reject truncated and trailing handshake bytes.
+   - Windows verifies Android's transcript confirmation and stored-secret proof. On first pairing, both devices show the same six-digit code and require local approval. Windows then sends its reciprocal key-confirmation frame containing marker `0x02` and a 16-byte transcript tag.
+3. **Session Key Derivation:** HKDF-SHA256 with info `ZeroLink-v3-AEAD-Session-Keys` derives 152 bytes: initiator AES key (32), initiator nonce base (12), responder AES key (32), responder nonce base (12), confirmation key (32), and first-pairing secret (32). Separate directional keys and nonce bases prevent nonce reuse across peers.
+4. **Pairing commit and reconnect:** After confirming Windows' key proof, Android stores the new secret using an Android Keystore AES-GCM wrapping key and sends encrypted `Signaling` payload `50 01`. Windows stores it using current-user DPAPI after receiving that marker. Feature packets remain gated until that acknowledgement is received. Returning peers prove possession in both handshake messages; one-sided or mismatched state is rejected without downgrade.
+5. **Key confirmation and counter nonce:** Each side computes the first 16 bytes of HMAC-SHA256 over a role-specific label (`ZeroLink-v3-server-key-confirmation` or `ZeroLink-v3-client-key-confirmation`) and `client_pubkey || salt || server_pubkey`. Directional sequence counters are authenticated and replayed values are rejected.
 
 ---
 
@@ -117,7 +119,7 @@ stateDiagram-v2
 Standard BLE GATT imposes high overhead: 3-byte ATT header per 20–244 byte MTU, attribute table queries, and connection interval negotiations for every write.
 
 ZeroLink bypasses GATT for data exchange, utilizing **BLE L2CAP CoC** directly:
-- **Dedicated PSM (Protocol/Service Multiplexer):** `0x1001` (dynamically assigned or standardized).
+- **PSM (Protocol/Service Multiplexer):** Android obtains the L2CAP CoC PSM from the OS at runtime, advertises it in ZeroLink BLE service data, and includes it in the handshake reply. Windows uses `0x1001` only as a compatibility fallback when an older advertisement omits the PSM.
 - **L2CAP MTU:** Negotiated up to 65535 bytes (standard operational MTU = 2048 bytes).
 - **Zero Polling:** Uses Bluetooth hardware interrupt triggers.
 - **Connection Parameters:**
@@ -130,7 +132,7 @@ ZeroLink bypasses GATT for data exchange, utilizing **BLE L2CAP CoC** directly:
 
 ## 5. Zero-Copy Packet Framing
 
-Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header followed by AES-GCM ciphertext and authentication tag (the 12-byte nonce is derived deterministically from the 8-byte sequence number XORed with the session IV base, requiring zero wire overhead):
+Every framed control packet transmitted over L2CAP or the primary TCP bridge adheres to a fixed 20-byte header followed by AES-GCM ciphertext and authentication tag (the 12-byte nonce is derived deterministically from the 8-byte sequence number XORed with the session IV base, requiring zero wire overhead). The separate bulk TCP socket uses fresh challenge-derived directional keys and AES-GCM for its single encrypted request and response; it does not use this frame header.
 
 ```
 +---------------+---------------+---------------+---------------+
@@ -161,7 +163,7 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
 | `FileChunk` | `0x06` | Android → Windows | `FileFetchChunk` |
 | `WifiWake` | `0x07` | Bidirectional | `WifiWakePayload` |
 | `ScreenCast` | `0x08` | Android → Windows | `VideoFrameHeader` + HEVC NAL units |
-| `Heartbeat` | `0x09` | Android → Windows | Battery, charging, Wi-Fi, QUIC port, power mode |
+| `Heartbeat` | `0x09` | Android → Windows | Battery, charging, Wi-Fi, bulk TCP port, power mode |
 | `KeepAlive` | `0x0A` | Bidirectional | Empty |
 | `NotificationAction` | `0x0B` | Windows → Android | `NotificationActionPayload` (notification id, action id, reply text) |
 | `MediaControl` | `0x0C` | Android → Windows | `MediaControlPayload` (1-byte command) |
@@ -192,16 +194,17 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
 - Toast arguments use the form `action=reply|dismiss&id=<notification key>` with percent-encoding; the reply text is read from the `quickReply` input of `ToastNotificationActivatedEventArgs.UserInput`.
 
 ### 6.3 Cloud Filter API (`cldapi.dll`) Virtual File System
-- Phone storage (DCIM / Downloads) is exposed as a virtual sync root using Windows Cloud Files API (`CfRegisterSyncRoot`).
-- Metadata is synchronized over L2CAP (file names, sizes, modified dates, thumbnails).
+- Android photos from DCIM / Screenshots are exposed as a virtual sync root using Windows Cloud Files API (`CfRegisterSyncRoot`).
+- Photo metadata is synchronized over the paired transport (file IDs, relative names, sizes, and modified dates).
 - Files appear in Windows File Explorer as 0-byte placeholders with `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`.
 - When the user opens or double-clicks a photo:
   1. Windows filesystem filter driver intercepts the read and invokes `CF_CALLBACK_TYPE_FETCH_DATA`.
-  2. ZeroLink daemon sends `WAKE_WIFI` via BLE to Android.
-  3. Android activates local ephemeral QUIC server.
-  4. Windows fetches file bytes over QUIC at > 60 MB/s.
-  5. Daemon writes data to the placeholder via `CfExecute(CF_OPERATION_TYPE_TRANSFER_DATA)`.
-  6. Wi-Fi tears down immediately after transfer.
+  2. ZeroLink daemon sends `WifiWake` and a random one-time token through the encrypted paired channel.
+  3. Android starts a temporary TCP listener and sends a fresh challenge to the Windows client.
+  4. Both sides derive separate AES-GCM request/response keys from the token and challenge. The token itself is never sent on the TCP socket; the request and returned byte range are authenticated and encrypted.
+  5. Windows completes the pending range through `CfExecute(CF_OPERATION_TYPE_TRANSFER_DATA)`.
+  6. The temporary listener closes after inactivity; Android restores Wi-Fi to its previous state.
+- **Validation status:** source and build checks cover the transfer path, but reading a real photo placeholder and measuring throughput still require an Android/Windows device pair.
 
 ### 6.4 Media Playback Control (GSMTC)
 - `windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager` provides the active session.
@@ -234,18 +237,13 @@ Every packet transmitted over L2CAP or QUIC adheres to a fixed 20-byte header fo
 - Push from Windows to Android uses `ClipboardManager.setPrimaryClip` from the foreground service, so no accessibility permission is required for that direction.
 
 ### 7.3 MediaProjection & H.265 Dynamic FPS Mirroring
-- Android `MediaCodec` initialized with `MIMETYPE_VIDEO_HEVC`.
-- Encoding settings:
-  - Target bitrate: 8 Mbps
-  - Color format: `COLOR_FormatSurface`
-  - Profile: `HEVCProfileMain`
-  - Dynamic frame rate throttling:
-    - Android VirtualDisplay uses a lightweight frame analyzer.
-    - If display buffer is untouched, encoder produces 0 frames.
-    - When touch or damage rectangle is detected, encoder produces up to 60 FPS in hardware with intra-refresh slices.
-- Low-latency delivery over QUIC Wi-Fi socket, decoded on Windows via D3D11 Video Acceleration (DXVA2/NVDEC/AMF).
+- Android captures a `MediaProjection` virtual display into a `MediaCodec` HEVC encoder. It prefers a codec input surface and falls back to `ImageReader` flexible-YUV input where advertised; capability discovery runs off the UI thread.
+- The service currently requests a 4 Mbps bitrate and 30 FPS. Actual codec, frame pacing, and power use depend on the device.
+- There is no separate frame analyzer or damage-rectangle throttler in the current source. Encoded buffers are forwarded with PTS, keyframe state, and the active width/height.
+- Android registers a `MediaProjection.Callback` before creating the virtual display. Android 14+ uses its captured-content resize callback; Android 10–13 use a default-display listener. Both resize the existing virtual display and recreate the encoder.
+- HEVC packets are forwarded over ZeroLink's transport. Windows prefers an asynchronous D3D11-aware Media Foundation hardware MFT. When available, DXGI NV12 decoder surfaces go directly to a D3D11 video processor and swap chain for aspect-fit presentation. Unsupported surfaces or unavailable D3D presentation fall back to staging-texture readback, CPU BGRA conversion, and GDI; a synchronous software MFT is also retained as a decoder fallback.
 
-> **Implementation status (current):** Android MediaCodec H.265 encoding and the packetized transport are implemented. The Windows `ScreenMirrorReceiver` creates a D3D11 device and parses/reassembles HEVC NAL metadata, but does not yet decode or render frames. Interactive `ScreenInput` (`0x0D`) capture therefore has no video window to attach to yet; Android-side gesture injection is implemented and ready.
+> **Implementation status (current):** Android MediaCodec H.265 encoding and packetized transport are implemented, including surface-first and flexible-YUV input selection. The API 36 emulator accepted capture consent and foreground-service promotion but exposed no HEVC size/rate combination for `1080x2209` or tested lower sizes; it emitted no frames. The 27-byte `VideoFrameHeader` includes encoder width and height; Windows uses that aspect ratio to normalize mouse input. Windows prefers asynchronous D3D11-aware Media Foundation decoding and presents supported decoder surfaces directly through D3D11, with CPU/GDI and synchronous software-decoder fallbacks. Android 14+ uses MediaProjection captured-content resize callbacks, while Android 10–13 use a default-display listener; both resize the existing virtual display and restart the encoder. Supported-device playback, rotation, and Android gesture injection remain unverified.
 
 ---
 

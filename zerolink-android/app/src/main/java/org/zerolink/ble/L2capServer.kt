@@ -11,6 +11,7 @@ import android.bluetooth.le.AdvertiseSettings
 import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
+import org.zerolink.PairingSecretStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,6 +22,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.UUID
 
 class L2capServer(
@@ -41,6 +43,7 @@ class L2capServer(
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
+    private val pairingSecretStore = PairingSecretStore(context)
 
     private var serverSocket: BluetoothServerSocket? = null
     private var clientSocket: BluetoothSocket? = null
@@ -49,7 +52,10 @@ class L2capServer(
 
     private var serverJob: Job? = null
     private var readerJob: Job? = null
-    private var assignedPsm: Int = 0
+    @Volatile private var assignedPsm: Int = 0
+    val psm: Int get() = assignedPsm
+    @Volatile private var expectedClientConfirmation: ByteArray? = null
+    @Volatile private var pendingFirstPairingApproval: Boolean = false
 
     @Volatile
     var isConnected: Boolean = false
@@ -118,9 +124,9 @@ class L2capServer(
                     clientSocket = socket
                     inputStream = socket.inputStream
                     outputStream = socket.outputStream
-                    isConnected = true
+                    isConnected = false
                     Log.i(TAG, "Windows client connected via L2CAP CoC: ${socket.remoteDevice.address}")
-                    onConnectionChanged(true)
+                    onConnectionChanged(false)
 
                     startReading()
                 } catch (e: Exception) {
@@ -162,8 +168,13 @@ class L2capServer(
                     readFully(inStream, payloadBuffer, 0, payloadLen)
 
                     if (packetType == PACKET_TYPE_HANDSHAKE) {
-                        handleHandshake(payloadBuffer)
+                        if (payloadBuffer.size >= 88) handleHandshake(payloadBuffer)
+                        else handleClientConfirmation(payloadBuffer)
                     } else {
+                        if (!isConnected) {
+                            Log.w(TAG, "Ignoring data packet before client key confirmation")
+                            continue
+                        }
                         // Construct full frame for JNI decryption
                         val fullFrame = ByteArray(HEADER_SIZE + payloadLen)
                         System.arraycopy(headerBuffer, 0, fullFrame, 0, HEADER_SIZE)
@@ -186,8 +197,13 @@ class L2capServer(
     }
 
     private fun handleHandshake(initPayload: ByteArray) {
-        if (initPayload.len() < 72) {
+        if (initPayload.size < 88) {
             Log.e(TAG, "Handshake payload too short: ${initPayload.size}")
+            return
+        }
+        val handshakeVersion = ByteBuffer.wrap(initPayload, 64, 4).order(ByteOrder.BIG_ENDIAN).int
+        if (handshakeVersion != 3) {
+            Log.e(TAG, "Unsupported handshake version: $handshakeVersion")
             return
         }
 
@@ -195,6 +211,24 @@ class L2capServer(
         val salt = ByteArray(32)
         System.arraycopy(initPayload, 0, clientPubkey, 0, 32)
         System.arraycopy(initPayload, 32, salt, 0, 32)
+        val clientNameLen = ByteBuffer.wrap(initPayload, 68, 4).order(ByteOrder.BIG_ENDIAN).int
+        if (clientNameLen < 0 || initPayload.size != 72 + clientNameLen + 16) {
+            Log.e(TAG, "Malformed HandshakeInit name or pairing proof")
+            return
+        }
+        val clientPairingTag = initPayload.copyOfRange(72 + clientNameLen, initPayload.size)
+        val clientName = String(initPayload, 72, clientNameLen, Charsets.UTF_8)
+        val storedPairingSecret = try {
+            pairingSecretStore.load()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not load paired-device secret; refusing fallback pairing", e)
+            return
+        }
+        val clientPairingTranscript = clientPubkey + salt
+        if (!PairingSecretStore.verifyPeerProof(storedPairingSecret, clientPairingTag, "client", clientPairingTranscript)) {
+            Log.e(TAG, "Windows pairing proof failed or pairing state is inconsistent")
+            return
+        }
 
         // 1. Generate server ephemeral keypair
         val serverPubkey = ZeroLinkNative.generateServerEphemeralKey() ?: run {
@@ -209,14 +243,32 @@ class L2capServer(
             return
         }
 
+        val transcript = "ZeroLink-v3-server-key-confirmation".toByteArray(Charsets.UTF_8) +
+            clientPubkey + salt + serverPubkey
+        val authTag = ZeroLinkNative.keyConfirmationTag(transcript) ?: run {
+            Log.e(TAG, "Failed to generate handshake key confirmation")
+            return
+        }
+        val clientTranscript = "ZeroLink-v3-client-key-confirmation".toByteArray(Charsets.UTF_8) +
+            clientPubkey + salt + serverPubkey
+        expectedClientConfirmation = ZeroLinkNative.keyConfirmationTag(clientTranscript) ?: run {
+            Log.e(TAG, "Failed to create expected client key confirmation")
+            return
+        }
+
         // 3. Serialize and send HandshakeReply
+        val serverPairingTranscript = clientPubkey + salt + serverPubkey
+        val serverPairingTag = storedPairingSecret?.let {
+            PairingSecretStore.authTag(it, "server", serverPairingTranscript)
+        } ?: ByteArray(16)
         val deviceName = (bluetoothAdapter?.name ?: "Android-ZeroLink").toByteArray(Charsets.UTF_8)
-        val replyBuf = ByteBuffer.allocate(32 + 16 + 2 + 4 + deviceName.size).order(ByteOrder.BIG_ENDIAN)
+        val replyBuf = ByteBuffer.allocate(32 + 16 + 2 + 4 + deviceName.size + 16).order(ByteOrder.BIG_ENDIAN)
         replyBuf.put(serverPubkey)
-        replyBuf.put(ByteArray(16)) // auth_tag placeholder
+        replyBuf.put(authTag)
         replyBuf.putShort(assignedPsm.toShort())
         replyBuf.putInt(deviceName.size)
         replyBuf.put(deviceName)
+        replyBuf.put(serverPairingTag)
 
         val replyPayload = replyBuf.array()
         // HandshakeReply frame has sequence 0, unencrypted
@@ -240,7 +292,73 @@ class L2capServer(
             out.flush()
         }
 
+        if (storedPairingSecret == null) {
+            val code = ZeroLinkNative.pairingCode(clientPubkey, salt, serverPubkey) ?: run {
+                Log.e(TAG, "Could not calculate pairing code")
+                handleDisconnect()
+                return
+            }
+            Log.i(TAG, "Waiting for local approval of first pairing with $clientName")
+            if (!org.zerolink.MainActivity.awaitPairingApprovalStatic(clientName, code)) {
+                Log.w(TAG, "First pairing was rejected, timed out, or no approval screen was available")
+                handleDisconnect()
+                return
+            }
+            pendingFirstPairingApproval = true
+        }
+
         Log.i(TAG, "Handshake completed successfully with Windows client!")
+    }
+
+    private fun handleClientConfirmation(payload: ByteArray) {
+        val expected = expectedClientConfirmation
+        if (payload.size != 17 || payload[0] != 0x02.toByte() || expected == null ||
+            !MessageDigest.isEqual(expected, payload.copyOfRange(1, 17))) {
+            Log.e(TAG, "Client key confirmation failed")
+            handleDisconnect()
+            return
+        }
+        expectedClientConfirmation = null
+        if (pendingFirstPairingApproval) {
+            val secret = ZeroLinkNative.pairingSecret() ?: run {
+                Log.e(TAG, "Could not retrieve the new pairing secret")
+                handleDisconnect()
+                return
+            }
+            try {
+                pairingSecretStore.save(secret)
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not persist the approved pairing", e)
+                handleDisconnect()
+                return
+            }
+            val acknowledgement = ZeroLinkNative.encryptAndFramePacket(
+                0x02,
+                byteArrayOf(0x50, 0x01)
+            ) ?: run {
+                Log.e(TAG, "Could not create pairing acknowledgement")
+                handleDisconnect()
+                return
+            }
+            try {
+                val out = outputStream ?: run {
+                    handleDisconnect()
+                    return
+                }
+                synchronized(out) {
+                    out.write(acknowledgement)
+                    out.flush()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Could not send pairing acknowledgement", e)
+                handleDisconnect()
+                return
+            }
+            pendingFirstPairingApproval = false
+        }
+        isConnected = true
+        onConnectionChanged(true)
+        Log.i(TAG, "Mutual handshake key confirmation succeeded")
     }
 
     @Synchronized
@@ -271,6 +389,8 @@ class L2capServer(
 
     private fun handleDisconnect() {
         isConnected = false
+        expectedClientConfirmation = null
+        pendingFirstPairingApproval = false
         try {
             inputStream?.close()
             outputStream?.close()

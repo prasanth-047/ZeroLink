@@ -35,7 +35,7 @@ class ZeroNotificationListener : NotificationListenerService() {
                 listener.cancelNotification(key)
                 true
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to cancel notification $key: ${e.message}")
+                Log.w(TAG, "Failed to cancel a remote notification: ${e.message}")
                 false
             }
         }
@@ -119,12 +119,12 @@ class ZeroNotificationListener : NotificationListenerService() {
         val actions = sbn.notification.actions ?: return
         for (action in actions) {
             val remoteInputs = action.remoteInputs ?: continue
-            if (remoteInputs.isEmpty()) continue
-            if (remoteInputs.none { it.allowFreeFormInput }) continue
+            val freeFormInputs = remoteInputs.filter { it.allowFreeFormInput }
+            if (freeFormInputs.isEmpty()) continue
             val pendingIntent = action.actionIntent ?: continue
             NotificationActionCache.put(
                 sbn.key,
-                CachedReplyAction(pendingIntent, remoteInputs)
+                CachedReplyAction(pendingIntent, freeFormInputs.toTypedArray())
             )
             return
         }

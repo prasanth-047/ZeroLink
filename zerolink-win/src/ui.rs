@@ -17,6 +17,7 @@ pub const ID_BTN_OPEN_PHOTOS: usize = 2001;
 pub const ID_BTN_TEST_TOAST: usize = 2002;
 pub const ID_BTN_TEST_CLIPBOARD: usize = 2003;
 pub const ID_BTN_SCREEN_MIRROR: usize = 2004;
+pub const ID_BTN_FORGET_DEVICE: usize = 2005;
 
 pub const WM_APP_APPEND_LOG: u32 = WM_USER + 101;
 pub const WM_APP_UPDATE_STATUS: u32 = WM_USER + 102;
@@ -31,6 +32,7 @@ pub enum UiCommand {
     TriggerTestToast,
     TriggerTestClipboard,
     ToggleScreenMirror,
+    ForgetPairedDevice,
     Quit,
 }
 
@@ -57,7 +59,12 @@ impl UiHandle {
         let wide: Vec<u16> = formatted.encode_utf16().collect();
         let ptr = Box::into_raw(Box::new(wide));
         unsafe {
-            let _ = PostMessageW(self.hwnd(), WM_APP_APPEND_LOG, WPARAM(ptr as usize), LPARAM(0));
+            let _ = PostMessageW(
+                self.hwnd(),
+                WM_APP_APPEND_LOG,
+                WPARAM(ptr as usize),
+                LPARAM(0),
+            );
         }
     }
 
@@ -69,14 +76,21 @@ impl UiHandle {
         let wide: Vec<u16> = info.encode_utf16().collect();
         let ptr = Box::into_raw(Box::new(wide));
         unsafe {
-            let _ = PostMessageW(self.hwnd(), WM_APP_UPDATE_STATUS, WPARAM(ptr as usize), LPARAM(0));
+            let _ = PostMessageW(
+                self.hwnd(),
+                WM_APP_UPDATE_STATUS,
+                WPARAM(ptr as usize),
+                LPARAM(0),
+            );
         }
     }
 }
 
 fn chrono_timestamp() -> String {
     let now = std::time::SystemTime::now();
-    let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let duration = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = duration.as_secs() % 86400;
     let hours = (secs / 3600) % 24;
     let mins = (secs % 3600) / 60;
@@ -148,29 +162,48 @@ pub fn spawn_ui_thread(
             w!("STATIC"),
             w!("ZeroLink \u{2014} Android & Windows Native Fabric (v0.1.0)"),
             WS_CHILD | WS_VISIBLE,
-            24, 16, 680, 22,
-            hwnd, HMENU(std::ptr::null_mut()), HINSTANCE(std::ptr::null_mut()), None,
+            24,
+            16,
+            680,
+            22,
+            hwnd,
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
         );
 
         // Subtitle
         let _sub_label = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("STATIC"),
-            w!("Ultra-low-power dual-radio state machine: BLE L2CAP CoC + Ephemeral Wi-Fi (< 15 MB RAM)"),
+            w!("Android & Windows link: BLE L2CAP CoC + local TCP / Wi-Fi transfer"),
             WS_CHILD | WS_VISIBLE,
-            24, 40, 680, 20,
-            hwnd, HMENU(std::ptr::null_mut()), HINSTANCE(std::ptr::null_mut()), None,
+            24,
+            40,
+            680,
+            20,
+            hwnd,
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
         );
 
         // Status Line
         let status_label = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("STATIC"),
-            w!("Status: Listening on 0.0.0.0:8989 | BLE Standby (0.0% CPU)"),
+            w!("Status: Listening on 0.0.0.0:8989 | BLE Standby"),
             WS_CHILD | WS_VISIBLE,
-            24, 72, 680, 20,
-            hwnd, HMENU(std::ptr::null_mut()), HINSTANCE(std::ptr::null_mut()), None,
-        ).unwrap();
+            24,
+            72,
+            680,
+            20,
+            hwnd,
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
+        )
+        .unwrap();
 
         // Target Device Line
         let device_label = CreateWindowExW(
@@ -178,9 +211,16 @@ pub fn spawn_ui_thread(
             w!("STATIC"),
             w!("Target Device: Scanning for ZeroLink BLE (UUID 0xFE2C)..."),
             WS_CHILD | WS_VISIBLE,
-            24, 96, 440, 20,
-            hwnd, HMENU(std::ptr::null_mut()), HINSTANCE(std::ptr::null_mut()), None,
-        ).unwrap();
+            24,
+            96,
+            440,
+            20,
+            hwnd,
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
+        )
+        .unwrap();
 
         // Battery Line
         let battery_label = CreateWindowExW(
@@ -188,9 +228,16 @@ pub fn spawn_ui_thread(
             w!("STATIC"),
             w!("Battery: --% | Wi-Fi: Standby"),
             WS_CHILD | WS_VISIBLE,
-            470, 96, 230, 20,
-            hwnd, HMENU(std::ptr::null_mut()), HINSTANCE(std::ptr::null_mut()), None,
-        ).unwrap();
+            470,
+            96,
+            230,
+            20,
+            hwnd,
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
+        )
+        .unwrap();
 
         // Action Buttons
         let _btn_open = CreateWindowExW(
@@ -198,8 +245,14 @@ pub fn spawn_ui_thread(
             w!("BUTTON"),
             w!("Open ZeroLink Photos"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            24, 130, 155, 32,
-            hwnd, HMENU(ID_BTN_OPEN_PHOTOS as *mut core::ffi::c_void), HINSTANCE(std::ptr::null_mut()), None,
+            24,
+            130,
+            155,
+            32,
+            hwnd,
+            HMENU(ID_BTN_OPEN_PHOTOS as *mut core::ffi::c_void),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
         );
 
         let _btn_toast = CreateWindowExW(
@@ -207,8 +260,14 @@ pub fn spawn_ui_thread(
             w!("BUTTON"),
             w!("Test Notification"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            190, 130, 155, 32,
-            hwnd, HMENU(ID_BTN_TEST_TOAST as *mut core::ffi::c_void), HINSTANCE(std::ptr::null_mut()), None,
+            190,
+            130,
+            155,
+            32,
+            hwnd,
+            HMENU(ID_BTN_TEST_TOAST as *mut core::ffi::c_void),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
         );
 
         let _btn_clip = CreateWindowExW(
@@ -216,8 +275,14 @@ pub fn spawn_ui_thread(
             w!("BUTTON"),
             w!("Test Clipboard Sync"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            356, 130, 155, 32,
-            hwnd, HMENU(ID_BTN_TEST_CLIPBOARD as *mut core::ffi::c_void), HINSTANCE(std::ptr::null_mut()), None,
+            356,
+            130,
+            155,
+            32,
+            hwnd,
+            HMENU(ID_BTN_TEST_CLIPBOARD as *mut core::ffi::c_void),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
         );
 
         let _btn_screen = CreateWindowExW(
@@ -225,8 +290,29 @@ pub fn spawn_ui_thread(
             w!("BUTTON"),
             w!("Screen Mirroring"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            522, 130, 155, 32,
-            hwnd, HMENU(ID_BTN_SCREEN_MIRROR as *mut core::ffi::c_void), HINSTANCE(std::ptr::null_mut()), None,
+            522,
+            130,
+            155,
+            32,
+            hwnd,
+            HMENU(ID_BTN_SCREEN_MIRROR as *mut core::ffi::c_void),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
+        );
+
+        let _btn_forget = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            w!("Forget Paired Device"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            24,
+            166,
+            155,
+            32,
+            hwnd,
+            HMENU(ID_BTN_FORGET_DEVICE as *mut core::ffi::c_void),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
         );
 
         // Activity Log Label
@@ -235,8 +321,14 @@ pub fn spawn_ui_thread(
             w!("STATIC"),
             w!("Live Activity & Security Telemetry:"),
             WS_CHILD | WS_VISIBLE,
-            24, 178, 680, 20,
-            hwnd, HMENU(std::ptr::null_mut()), HINSTANCE(std::ptr::null_mut()), None,
+            24,
+            208,
+            680,
+            20,
+            hwnd,
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
         );
 
         // Live Log Edit box (Read-only, multi-line, vertical scroll)
@@ -246,9 +338,16 @@ pub fn spawn_ui_thread(
             w!("EDIT"),
             w!(""),
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_BORDER | WINDOW_STYLE(0x0004 | 0x0040 | 0x0800),
-            24, 202, 675, 300,
-            hwnd, HMENU(std::ptr::null_mut()), HINSTANCE(std::ptr::null_mut()), None,
-        ).unwrap();
+            24,
+            232,
+            675,
+            270,
+            hwnd,
+            HMENU(std::ptr::null_mut()),
+            HINSTANCE(std::ptr::null_mut()),
+            None,
+        )
+        .unwrap();
 
         let state = Box::new(WindowState {
             cmd_tx,
@@ -291,7 +390,13 @@ pub fn spawn_ui_thread(
     });
 
     let hwnd_val = hwnd_rx.recv().expect("UI thread failed to produce HWND");
-    (UiHandle { hwnd_val, is_running }, handle)
+    (
+        UiHandle {
+            hwnd_val,
+            is_running,
+        },
+        handle,
+    )
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -307,7 +412,7 @@ unsafe extern "system" fn wnd_proc(
 
     match msg {
         WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as usize;
+            let id = wparam.0 & 0xFFFF;
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
                 match id {
@@ -322,6 +427,9 @@ unsafe extern "system" fn wnd_proc(
                     }
                     ID_BTN_SCREEN_MIRROR => {
                         let _ = state.cmd_tx.send(UiCommand::ToggleScreenMirror);
+                    }
+                    ID_BTN_FORGET_DEVICE => {
+                        let _ = state.cmd_tx.send(UiCommand::ForgetPairedDevice);
                     }
                     _ => {}
                 }
@@ -370,9 +478,9 @@ unsafe extern "system" fn wnd_proc(
                         let is_connected = parts[2].trim() == "1";
 
                         let status_str = if is_connected {
-                            format!("Status: Connected | Dual-Radio Active | < 15 MB RAM\0")
+                            "Status: Connected | Dual-Radio Active\0".to_string()
                         } else {
-                            format!("Status: Listening on 0.0.0.0:8989 | BLE Standby (0.0% CPU)\0")
+                            "Status: Listening on 0.0.0.0:8989 | BLE Standby\0".to_string()
                         };
                         let dev_str = format!("Device: {}\0", name);
                         let batt_str = format!("Battery: {}% | Wi-Fi: Ready\0", battery);

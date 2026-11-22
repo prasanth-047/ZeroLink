@@ -90,8 +90,8 @@ pub fn execute_command(command: MediaCommand) -> bool {
         return true;
     }
 
-    let Ok(manager) = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
-        .and_then(|op| op.get())
+    let Ok(manager) =
+        GlobalSystemMediaTransportControlsSessionManager::RequestAsync().and_then(|op| op.get())
     else {
         return false;
     };

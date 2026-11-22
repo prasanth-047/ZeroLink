@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name=".PairingApprovalDialogTestActivity"
+            android:exported="false"
+            android:theme="@style/Theme.ZeroLink" />
+        <receiver
+            android:name=".NotificationReplyCaptureReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

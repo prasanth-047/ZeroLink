@@ -279,6 +279,14 @@
             android:textColor="#F1F5F9"
             android:textSize="14sp" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Photo access is requested only when you sync. On Android 14+, you can share selected photos or grant broader access."
+            android:textColor="#94A3B8"
+            android:textSize="12sp" />
+
         <Button
             android:id="@+id/btn_sync_photos"
             android:layout_width="match_parent"
@@ -297,6 +305,17 @@
             android:layout_marginTop="10dp"
             android:backgroundTint="#334155"
             android:text="📱 Start Screen Mirroring"
+            android:textAllCaps="false"
+            android:textColor="#F1F5F9"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_forget_pairing"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:layout_marginTop="10dp"
+            android:backgroundTint="#7F1D1D"
+            android:text="🔐 Forget Paired Windows Device"
             android:textAllCaps="false"
             android:textColor="#F1F5F9"
             android:textSize="14sp" />

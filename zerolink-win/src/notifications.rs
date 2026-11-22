@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use tokio::sync::mpsc::UnboundedSender;
-use windows::core::{HSTRING, Interface, Result as WinResult};
+use windows::core::{Interface, Result as WinResult, HSTRING};
 use windows::ApplicationModel::Activation::ToastNotificationActivatedEventArgs;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::Collections::ValueSet;

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use windows::core::w;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
     RemoveClipboardFormatListener, SetClipboardData,
@@ -36,7 +36,7 @@ impl ClipboardManager {
     }
 
     /// Spawns the dedicated Win32 message-only window loop.
-    /// Operates at strictly 0.0% CPU when clipboard is untouched.
+    /// Waits for clipboard messages while the clipboard is unchanged.
     pub fn start_listener(&self) -> std::thread::JoinHandle<()> {
         let last_remote = Arc::clone(&self.last_remote_hash);
         let last_local = Arc::clone(&self.last_local_hash);
@@ -93,7 +93,8 @@ impl ClipboardManager {
                                 timestamp_ms: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_millis() as u64,
+                                    .as_millis()
+                                    as u64,
                                 data: text.into_bytes(),
                             };
                             let _ = sender.send(payload);
@@ -109,36 +110,63 @@ impl ClipboardManager {
         })
     }
 
-    /// Sets clipboard content received from Android, recording hash to prevent echo loops.
-    pub fn inject_remote_clipboard(&self, payload: &ClipboardPayload) {
-        self.last_remote_hash
-            .store(payload.payload_hash, Ordering::Relaxed);
+    /// Sets clipboard content received from Android and reports Win32 failures.
+    pub fn inject_remote_clipboard(&self, payload: &ClipboardPayload) -> Result<(), String> {
+        let text = String::from_utf8_lossy(&payload.data);
+        let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes_needed = utf16.len() * std::mem::size_of::<u16>();
 
         unsafe {
-            if OpenClipboard(HWND(std::ptr::null_mut())).is_err() {
-                return;
+            let h_mem = GlobalAlloc(GMEM_MOVEABLE, bytes_needed)
+                .map_err(|error| format!("GlobalAlloc failed: {error}"))?;
+            let ptr = GlobalLock(h_mem);
+            if ptr.is_null() {
+                let _ = GlobalFree(h_mem);
+                return Err("GlobalLock returned a null pointer".into());
             }
-
-            let _ = EmptyClipboard();
-
-            let text = String::from_utf8_lossy(&payload.data);
-            let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-            let bytes_needed = utf16.len() * std::mem::size_of::<u16>();
-
-            if let Ok(h_mem) = GlobalAlloc(GMEM_MOVEABLE, bytes_needed) {
-                let ptr = GlobalLock(h_mem);
-                if !ptr.is_null() {
-                    std::ptr::copy_nonoverlapping(
-                        utf16.as_ptr() as *const u8,
-                        ptr as *mut u8,
-                        bytes_needed,
-                    );
-                    let _ = GlobalUnlock(h_mem);
-                    let _ = SetClipboardData(CF_UNICODETEXT, HANDLE(h_mem.0 as _));
+            std::ptr::copy_nonoverlapping(
+                utf16.as_ptr() as *const u8,
+                ptr as *mut u8,
+                bytes_needed,
+            );
+            if let Err(error) = GlobalUnlock(h_mem) {
+                // GlobalUnlock returns FALSE for both an API error and a
+                // successful release of the final lock; ERROR_SUCCESS
+                // distinguishes the normal final-unlock case.
+                if error.code().0 != 0 {
+                    let _ = GlobalFree(h_mem);
+                    return Err(format!("GlobalUnlock failed: {error}"));
                 }
             }
 
-            let _ = CloseClipboard();
+            if let Err(error) = OpenClipboard(HWND(std::ptr::null_mut())) {
+                let _ = GlobalFree(h_mem);
+                return Err(format!("OpenClipboard failed: {error}"));
+            }
+
+            let result = (|| {
+                if let Err(error) = EmptyClipboard() {
+                    let _ = GlobalFree(h_mem);
+                    return Err(format!("EmptyClipboard failed: {error}"));
+                }
+                let previous_hash = self.last_remote_hash.load(Ordering::Relaxed);
+                self.last_remote_hash
+                    .store(payload.payload_hash, Ordering::Relaxed);
+                if let Err(error) = SetClipboardData(CF_UNICODETEXT, HANDLE(h_mem.0 as _)) {
+                    self.last_remote_hash
+                        .store(previous_hash, Ordering::Relaxed);
+                    let _ = GlobalFree(h_mem);
+                    return Err(format!("SetClipboardData failed: {error}"));
+                }
+                Ok(())
+            })();
+            let close_result =
+                CloseClipboard().map_err(|error| format!("CloseClipboard failed: {error}"));
+            match (result, close_result) {
+                (Err(error), _) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+                (Ok(()), Ok(())) => Ok(()),
+            }
         }
     }
 }
@@ -179,10 +207,7 @@ unsafe fn read_clipboard_text(hwnd: HWND) -> Option<String> {
 
     let max_u16 = size / 2;
     let wide_slice = std::slice::from_raw_parts(ptr as *const u16, max_u16);
-    let len = wide_slice
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(max_u16);
+    let len = wide_slice.iter().position(|&c| c == 0).unwrap_or(max_u16);
 
     let text = String::from_utf16_lossy(&wide_slice[..len]);
 

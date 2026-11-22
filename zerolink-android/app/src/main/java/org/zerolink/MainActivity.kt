@@ -1,6 +1,8 @@
 package org.zerolink
 
 import android.Manifest
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -15,18 +17,25 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.app.NotificationCompat
+import androidx.appcompat.app.AlertDialog
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import org.zerolink.media.PhotoAccess
 import org.zerolink.protocol.MediaCommand
 import org.zerolink.protocol.MediaState
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
 
@@ -36,6 +45,22 @@ class MainActivity : AppCompatActivity() {
             private set
 
         private val mainHandler = Handler(Looper.getMainLooper())
+        private const val PAIRING_NOTIFICATION_ID = 2001
+        private const val PAIRING_APPROVAL_TIMEOUT_MS = 120_000L
+        private const val PAIRING_APPROVAL_WAIT_GRACE_MS = 5_000L
+
+        private class PairingApprovalRequest(
+            val peerName: String,
+            val code: String,
+            val respond: (Boolean) -> Unit
+        ) {
+            val answered = AtomicBoolean(false)
+            var dialog: AlertDialog? = null
+            var timeout: Runnable? = null
+        }
+
+        @Volatile
+        private var pendingPairingApproval: PairingApprovalRequest? = null
 
         fun appendLogStatic(msg: String) {
             mainHandler.post {
@@ -55,9 +80,111 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        fun refreshServiceStateStatic() {
+            mainHandler.post {
+                activeActivity?.updateUiState()
+            }
+        }
+
         fun updateMediaStateStatic(state: MediaState) {
             mainHandler.post {
                 activeActivity?.updateMediaState(state)
+            }
+        }
+
+        fun requestPairingApprovalStatic(
+            peerName: String,
+            code: String,
+            respond: (Boolean) -> Unit,
+            timeoutMs: Long = PAIRING_APPROVAL_TIMEOUT_MS,
+        ) {
+            require(timeoutMs > 0L)
+            val request = PairingApprovalRequest(peerName, code, respond)
+            val previous = synchronized(this) {
+                val old = pendingPairingApproval
+                pendingPairingApproval = request
+                old
+            }
+            previous?.let { old -> mainHandler.post { finishPairingApproval(old, false) } }
+            mainHandler.post {
+                request.timeout = Runnable { finishPairingApproval(request, false) }
+                mainHandler.postDelayed(request.timeout!!, timeoutMs)
+                showPairingApproval(request)
+            }
+        }
+
+        private fun showPairingApproval(request: PairingApprovalRequest) {
+            if (request.answered.get() || pendingPairingApproval !== request) return
+            if (request.dialog?.isShowing == true) return
+            val activity = activeActivity
+            if (activity == null || activity.isFinishing || activity.isDestroyed) {
+                val app = ZeroLinkApplication.instance
+                val launchIntent = Intent(app, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                }
+                val pendingIntent = PendingIntent.getActivity(
+                    app,
+                    PAIRING_NOTIFICATION_ID,
+                    launchIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                val notification = NotificationCompat.Builder(app, ZeroLinkApplication.PAIRING_CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                    .setContentTitle("Approve a ZeroLink device")
+                    .setContentText("Tap to compare the pairing code for ${request.peerName}.")
+                    .setContentIntent(pendingIntent)
+                    .setAutoCancel(true)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .build()
+                val manager = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                try {
+                    manager.notify(PAIRING_NOTIFICATION_ID, notification)
+                } catch (e: SecurityException) {
+                    Log.w("ZeroLink.Pairing", "Notification permission is unavailable; waiting for the app to open", e)
+                }
+                return
+            }
+            request.dialog = PairingApprovalDialog.show(activity, request.peerName, request.code) { approved ->
+                finishPairingApproval(request, approved)
+            }
+        }
+
+        private fun finishPairingApproval(request: PairingApprovalRequest, approved: Boolean) {
+            if (!request.answered.compareAndSet(false, true)) return
+            request.timeout?.let { mainHandler.removeCallbacks(it) }
+            request.dialog?.dismiss()
+            request.dialog = null
+            if (pendingPairingApproval === request) pendingPairingApproval = null
+            val manager = ZeroLinkApplication.instance.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.cancel(PAIRING_NOTIFICATION_ID)
+            request.respond(approved)
+        }
+
+        fun showPendingPairingApproval() {
+            pendingPairingApproval?.let { request -> showPairingApproval(request) }
+        }
+
+        fun awaitPairingApprovalStatic(
+            peerName: String,
+            code: String,
+            timeoutMs: Long = PAIRING_APPROVAL_TIMEOUT_MS,
+        ): Boolean {
+            val latch = CountDownLatch(1)
+            var approved = false
+            requestPairingApprovalStatic(
+                peerName,
+                code,
+                { decision ->
+                    approved = decision
+                    latch.countDown()
+                },
+                timeoutMs
+            )
+            return try {
+                latch.await(timeoutMs + PAIRING_APPROVAL_WAIT_GRACE_MS, TimeUnit.MILLISECONDS) && approved
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
             }
         }
     }
@@ -77,6 +204,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSendNotif: Button
     private lateinit var btnSyncPhotos: Button
     private lateinit var btnScreenMirror: Button
+    private lateinit var btnForgetPairing: Button
     private lateinit var tvMediaTitle: TextView
     private lateinit var tvMediaArtist: TextView
     private lateinit var tvMediaApp: TextView
@@ -100,23 +228,55 @@ class MainActivity : AppCompatActivity() {
         updateUiState()
     }
 
+    private val photoPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        if (PhotoAccess.hasImageAccess(this)) {
+            appendLog("📁 Photo access granted. Syncing the available photo catalog.")
+            sendPhotoCatalogToPc()
+        } else {
+            appendLog("📁 Photo access was not granted; other ZeroLink features remain available.")
+            Toast.makeText(this, "Photo access is needed to sync the catalog", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == RESULT_OK && result.data != null) {
+        val service = ZeroLinkService.instance
+        if (result.resultCode != RESULT_OK || result.data == null) {
+            service?.finishScreenMirroringPreparation()
+            appendLog("⚠️ Screen capture permission was not granted")
+            return@registerForActivityResult
+        }
+
+        if (service == null) {
+            appendLog("⚠️ ZeroLinkService is not running")
+            return@registerForActivityResult
+        }
+
+        if (!service.prepareForScreenMirroring()) {
+            appendLog("❌ Could not promote ZeroLinkService for screen capture")
+            return@registerForActivityResult
+        }
+
+        try {
             val mp = mediaProjectionManager?.getMediaProjection(result.resultCode, result.data!!)
             if (mp != null) {
                 val dm = resources.displayMetrics
                 val w = if (dm.widthPixels > 0) dm.widthPixels else 720
                 val h = if (dm.heightPixels > 0) dm.heightPixels else 1600
                 val dpi = if (dm.densityDpi > 0) dm.densityDpi else 300
-                ZeroLinkService.instance?.startScreenMirroring(mp, w, h, dpi)
+                service.startScreenMirroring(mp, w, h, dpi)
                 updateUiState()
             } else {
+                service.finishScreenMirroringPreparation()
                 appendLog("❌ Failed to obtain MediaProjection handle")
             }
-        } else {
-            appendLog("⚠️ Screen capture permission was not granted")
+        } catch (e: SecurityException) {
+            service.finishScreenMirroringPreparation()
+            Log.e("ZeroLink.ScreenMirror", "Could not create MediaProjection", e)
+            appendLog("❌ Android denied the screen capture session: ${e.message}")
         }
     }
 
@@ -139,6 +299,7 @@ class MainActivity : AppCompatActivity() {
         btnSendNotif = findViewById(R.id.btn_send_notif)
         btnSyncPhotos = findViewById(R.id.btn_sync_photos)
         btnScreenMirror = findViewById(R.id.btn_screen_mirror)
+        btnForgetPairing = findViewById(R.id.btn_forget_pairing)
         tvMediaTitle = findViewById(R.id.tv_media_title)
         tvMediaArtist = findViewById(R.id.tv_media_artist)
         tvMediaApp = findViewById(R.id.tv_media_app)
@@ -169,6 +330,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         activeActivity = this
+        showPendingPairingApproval()
         updateUiState()
     }
 
@@ -275,7 +437,7 @@ class MainActivity : AppCompatActivity() {
             val testText = "ZeroLink Android Sync @ ${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())}"
             val clip = ClipData.newPlainText("ZeroLink", testText)
             cm.setPrimaryClip(clip)
-            appendLog("📋 Copied to clipboard: '$testText'")
+            appendLog("📋 Test clipboard value copied")
             val s = ZeroLinkService.instance
             if (s != null) {
                 val ok = s.sendClipboard(testText)
@@ -307,17 +469,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnSyncPhotos.setOnClickListener {
-            val s = ZeroLinkService.instance
-            if (s != null) {
-                val ok = s.sendPhotoCatalog()
-                if (ok) {
-                    Toast.makeText(this, "Photos catalog synced to PC!", Toast.LENGTH_SHORT).show()
-                } else {
-                    appendLog("⚠️ Failed to sync photos (device not connected)")
-                }
-            } else {
-                appendLog("⚠️ ZeroLinkService is not running")
-            }
+            syncPhotosOrRequestAccess()
         }
 
         btnScreenMirror.setOnClickListener {
@@ -333,6 +485,19 @@ class MainActivity : AppCompatActivity() {
             } else {
                 appendLog("⚠️ ZeroLinkService is not running")
             }
+        }
+
+        btnForgetPairing.setOnClickListener {
+            AlertDialog.Builder(this)
+                .setTitle("Forget paired Windows device?")
+                .setMessage("This removes the saved pairing secret. If the devices are offline, use Forget on both devices before pairing again.")
+                .setPositiveButton("Forget") { _, _ ->
+                    val removed = ZeroLinkService.instance?.forgetPairedDevice()
+                        ?: runCatching { PairingSecretStore(this).clear() }.isSuccess
+                    if (!removed) appendLog("⚠️ Could not remove the saved pairing")
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
         }
 
         btnMediaPrev.setOnClickListener {
@@ -403,7 +568,7 @@ class MainActivity : AppCompatActivity() {
             btnToggleService.text = "Stop ZeroLink Service"
             btnToggleService.setBackgroundColor(0xFFDC2626.toInt()) // Red
 
-            tvBleStatus.text = "BLE Radio: 🟢 Advertising (UUID 0xFE2C, PSM: 0x88)"
+            tvBleStatus.text = "BLE Radio: 🟢 Advertising (UUID 0xFE2C, PSM: ${currentL2capPsmLabel()})"
             tvBleStatus.setTextColor(0xFF4ADE80.toInt())
 
             if (s?.networkBridge?.isConnected == true) {
@@ -474,9 +639,14 @@ class MainActivity : AppCompatActivity() {
             tvBleStatus.text = "BLE Radio: 🟢 Connected via L2CAP CoC"
             tvBleStatus.setTextColor(0xFF4ADE80.toInt())
         } else {
-            tvBleStatus.text = "BLE Radio: 🟢 Advertising (UUID 0xFE2C, PSM: 0x88)"
+            tvBleStatus.text = "BLE Radio: 🟢 Advertising (UUID 0xFE2C, PSM: ${currentL2capPsmLabel()})"
             tvBleStatus.setTextColor(0xFF4ADE80.toInt())
         }
+    }
+
+    private fun currentL2capPsmLabel(): String {
+        val psm = ZeroLinkService.instance?.activeL2capPsm ?: 0
+        return if (psm > 0) "0x${psm.toString(16).padStart(4, '0')}" else "pending"
     }
 
     private fun hasRequiredPermissions(): Boolean {
@@ -508,6 +678,44 @@ class MainActivity : AppCompatActivity() {
             toRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
         permissionLauncher.launch(toRequest.toTypedArray())
+    }
+
+    private fun syncPhotosOrRequestAccess() {
+        if (ZeroLinkService.instance == null) {
+            appendLog("⚠️ ZeroLinkService is not running")
+            return
+        }
+        if (!PhotoAccess.hasImageAccess(this)) {
+            appendLog("Requesting photo access for the catalog only...")
+            photoPermissionLauncher.launch(PhotoAccess.permissionsToRequest())
+            return
+        }
+        if (PhotoAccess.hasPartialImageAccess(this)) {
+            AlertDialog.Builder(this)
+                .setTitle("Photo access is limited")
+                .setMessage("ZeroLink can currently see only the photos you selected. Sync that selection or choose more photos.")
+                .setPositiveButton("Sync selection") { _, _ -> sendPhotoCatalogToPc() }
+                .setNegativeButton("Choose more") { _, _ ->
+                    photoPermissionLauncher.launch(PhotoAccess.permissionsToRequest())
+                }
+                .setNeutralButton("Cancel", null)
+                .show()
+            return
+        }
+        sendPhotoCatalogToPc()
+    }
+
+    private fun sendPhotoCatalogToPc() {
+        val service = ZeroLinkService.instance
+        if (service == null) {
+            appendLog("⚠️ ZeroLinkService is not running")
+            return
+        }
+        if (service.sendPhotoCatalog()) {
+            Toast.makeText(this, "Photos catalog synced to PC!", Toast.LENGTH_SHORT).show()
+        } else {
+            appendLog("⚠️ Could not sync photos; check the PC connection and photo access")
+        }
     }
 
     fun appendLog(msg: String) {

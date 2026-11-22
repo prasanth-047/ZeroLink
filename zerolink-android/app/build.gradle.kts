@@ -13,6 +13,9 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "android.test.InstrumentationTestRunner"
+        testInstrumentationRunnerArguments["class"] =
+            "org.zerolink.PairingSecretStorePersistenceTest"
 
         ndk {
             // ABIs to include for the native Rust JNI library
@@ -53,6 +56,15 @@ android {
 }
 
 dependencies {
+    val androidTestOptional = android.sdkDirectory.resolve("platforms/android-34/optional")
+    androidTestCompileOnly(
+        files(
+            androidTestOptional.resolve("android.test.base.jar"),
+            androidTestOptional.resolve("android.test.mock.jar"),
+            androidTestOptional.resolve("android.test.runner.jar"),
+        )
+    )
+
     // AndroidX Core
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")

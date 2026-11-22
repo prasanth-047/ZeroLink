@@ -27,12 +27,14 @@ import org.zerolink.clipboard.ZeroAccessibilityService
 import org.zerolink.clipboard.ZeroClipboardManager
 import org.zerolink.media.H265ScreenEncoder
 import org.zerolink.media.MediaControlReceiver
+import org.zerolink.media.PhotoAccess
 import org.zerolink.network.NetworkTransportBridge
 import org.zerolink.notifications.NotificationActionCache
 import org.zerolink.notifications.ZeroNotificationListener
 import org.zerolink.protocol.CatalogItem
 import org.zerolink.protocol.MediaCommand
 import org.zerolink.protocol.MediaState
+import org.zerolink.protocol.WifiWakePayload
 import org.zerolink.protocol.ZeroLinkProtocol
 import org.zerolink.wifi.EphemeralWifiManager
 import java.nio.ByteBuffer
@@ -49,6 +51,7 @@ class ZeroLinkService : Service() {
         private const val PACKET_TYPE_MEDIA_CONTROL = 0x0C
         private const val PACKET_TYPE_SCREEN_INPUT = 0x0D
         private const val PACKET_TYPE_MEDIA_STATE = 0x0E
+        private const val PACKET_TYPE_SIGNALING = 0x02
 
         @Volatile
         var instance: ZeroLinkService? = null
@@ -59,6 +62,8 @@ class ZeroLinkService : Service() {
 
     lateinit var l2capServer: L2capServer
         private set
+    val activeL2capPsm: Int
+        get() = if (::l2capServer.isInitialized) l2capServer.psm else 0
     lateinit var networkBridge: NetworkTransportBridge
         private set
     lateinit var clipboardManager: ZeroClipboardManager
@@ -94,7 +99,8 @@ class ZeroLinkService : Service() {
             scope = serviceScope,
             onPacketReceived = ::handleIncomingPacket,
             onConnectionChanged = ::handleNetworkConnectionState,
-            onLog = { msg -> MainActivity.appendLogStatic(msg) }
+            onLog = { msg -> MainActivity.appendLogStatic(msg) },
+            l2capPsmProvider = { l2capServer.psm }
         )
 
         clipboardManager = ZeroClipboardManager(this, ::sendPacket)
@@ -105,6 +111,7 @@ class ZeroLinkService : Service() {
         startPeriodicHeartbeat()
 
         Log.i(TAG, "ZeroLinkService running in ultra-low-power idle state (< 100 mAh / day)")
+        MainActivity.refreshServiceStateStatic()
     }
 
     private fun startForegroundNotification() {
@@ -255,7 +262,7 @@ class ZeroLinkService : Service() {
         return if (::clipboardManager.isInitialized) {
             val sent = clipboardManager.sendClipboardText(text)
             if (sent) {
-                MainActivity.appendLogStatic("📋 Dispatched clipboard to PC: '$text'")
+                MainActivity.appendLogStatic("📋 Clipboard sent to PC")
             }
             sent
         } else false
@@ -285,12 +292,18 @@ class ZeroLinkService : Service() {
         )
         val sent = sendPacket(0x03, payload)
         if (sent) {
-            MainActivity.appendLogStatic("🔔 Sent notification: '$title'")
+            MainActivity.appendLogStatic("🔔 Notification sent to PC")
         }
         return sent
     }
 
     fun sendPhotoCatalog(): Boolean {
+        if (!PhotoAccess.hasImageAccess(this)) {
+            Log.i(TAG, "Photo catalog not sent because image access has not been granted")
+            MainActivity.appendLogStatic("📁 Grant photo access from Sync Photos to share the catalog")
+            return false
+        }
+
         val items = mutableListOf<CatalogItem>()
         try {
             val projection = arrayOf(
@@ -328,13 +341,6 @@ class ZeroLinkService : Service() {
             Log.w(TAG, "MediaStore scan error: ${e.message}")
         }
 
-        if (items.isEmpty()) {
-            val now = System.currentTimeMillis()
-            items.add(CatalogItem("img_001", "Camera/IMG_20261104_142301.jpg", 3_452_190L, now, "image/jpeg"))
-            items.add(CatalogItem("img_002", "Camera/IMG_20261104_150244.jpg", 4_120_800L, now - 3600_000L, "image/jpeg"))
-            items.add(CatalogItem("scr_001", "Screenshots/Screenshot_20261104.png", 1_824_500L, now - 7200_000L, "image/png"))
-        }
-
         val payload = ZeroLinkProtocol.serializeFileCatalog("ZeroLink Photos", items)
         val sent = sendPacket(0x05, payload)
         if (sent) {
@@ -343,24 +349,80 @@ class ZeroLinkService : Service() {
         return sent
     }
 
+    fun prepareForScreenMirroring(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+        return try {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification(currentMediaState),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not enable the media-projection foreground-service type", e)
+            false
+        }
+    }
+
+    fun finishScreenMirroringPreparation() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || isScreenMirroringActive) return
+        try {
+            startForeground(
+                NOTIFICATION_ID,
+                buildNotification(currentMediaState),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not restore the connected-device foreground-service type", e)
+        }
+    }
+
     fun startScreenMirroring(mediaProjection: MediaProjection, width: Int, height: Int, dpi: Int) {
-        stopScreenMirroring()
+        screenEncoder?.stop()
+        screenEncoder = null
         screenFrameSeq.set(0)
         MainActivity.appendLogStatic("📱 Initializing H.265 screen encoder (${width}x${height} @ ${dpi}dpi)...")
 
-        screenEncoder = H265ScreenEncoder(
+        lateinit var encoder: H265ScreenEncoder
+        encoder = H265ScreenEncoder(
+            context = this,
             width = width,
             height = height,
             dpi = dpi,
             bitrateBps = 4_000_000,
-            maxFps = 30
-        ) { nalData, ptsUs, isKeyframe ->
-            val seq = screenFrameSeq.getAndIncrement()
-            val framePayload = ZeroLinkProtocol.serializeScreenFrame(seq, ptsUs, isKeyframe, nalData)
-            sendPacket(0x08, framePayload)
-        }
-        screenEncoder?.start(mediaProjection)
-        MainActivity.appendLogStatic("📱 Screen mirroring streaming active")
+            maxFps = 30,
+            onNalUnitEncoded = { nalData, ptsUs, isKeyframe, frameWidth, frameHeight ->
+                val seq = screenFrameSeq.getAndIncrement()
+                val framePayload = ZeroLinkProtocol.serializeScreenFrame(
+                    seq, ptsUs, isKeyframe, nalData, frameWidth, frameHeight
+                )
+                sendPacket(0x08, framePayload)
+            },
+            onStarted = { started ->
+                serviceScope.launch(Dispatchers.Main) {
+                    if (started) {
+                        if (screenEncoder === encoder) {
+                            MainActivity.appendLogStatic("📱 Screen mirroring streaming active")
+                        }
+                    } else {
+                        MainActivity.appendLogStatic("❌ H.265 screen encoder could not start")
+                    }
+                    MainActivity.refreshServiceStateStatic()
+                }
+            },
+            onStopped = {
+                serviceScope.launch(Dispatchers.Main) {
+                    if (screenEncoder === encoder) {
+                        screenEncoder = null
+                        finishScreenMirroringPreparation()
+                        MainActivity.refreshServiceStateStatic()
+                    }
+                }
+            }
+        )
+        screenEncoder = encoder
+        encoder.start(mediaProjection)
     }
 
     fun stopScreenMirroring() {
@@ -369,10 +431,33 @@ class ZeroLinkService : Service() {
             screenEncoder = null
             MainActivity.appendLogStatic("📱 Screen mirroring stopped")
         }
+        finishScreenMirroringPreparation()
     }
 
     private fun handleIncomingPacket(packetType: Int, payload: ByteArray) {
         when (packetType) {
+            PACKET_TYPE_SIGNALING -> {
+                if (payload.contentEquals(byteArrayOf(0x50, 0x02))) {
+                    if (sendPacket(PACKET_TYPE_SIGNALING, byteArrayOf(0x50, 0x03))) {
+                        try {
+                            PairingSecretStore(this).clear()
+                            MainActivity.appendLogStatic("🔐 Windows requested pairing removal. This device is now forgotten.")
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Could not remove paired-device secret", e)
+                        }
+                    } else {
+                        MainActivity.appendLogStatic("⚠️ Could not acknowledge Windows pairing removal")
+                    }
+                } else if (payload.contentEquals(byteArrayOf(0x50, 0x03))) {
+                    try {
+                        PairingSecretStore(this).clear()
+                        MainActivity.appendLogStatic("🔐 Windows acknowledged pairing removal. This device is now forgotten.")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Could not remove paired-device secret", e)
+                        MainActivity.appendLogStatic("⚠️ Could not remove the saved Windows pairing")
+                    }
+                }
+            }
             L2capServer.PACKET_TYPE_CLIPBOARD -> {
                 // Clipboard payload format: format (1B) + hash (8B) + timestamp (8B) + len (4B) + data
                 if (payload.size >= 21) {
@@ -383,8 +468,7 @@ class ZeroLinkService : Service() {
                         val data = ByteArray(dataLen)
                         System.arraycopy(payload, 21, data, 0, dataLen)
                         clipboardManager.injectRemoteClipboard(format, hash, data)
-                        val text = String(data, Charsets.UTF_8)
-                        MainActivity.appendLogStatic("📋 Received Windows Clipboard: '$text'")
+                        MainActivity.appendLogStatic("📋 Received Windows clipboard")
                     }
                 }
             }
@@ -399,9 +483,9 @@ class ZeroLinkService : Service() {
                                 action.replyText
                             )
                             val log = if (delivered) {
-                                "💬 Inline reply delivered to Android: '${action.replyText}'"
+                                "💬 Inline reply delivered to Android"
                             } else {
-                                "⚠️ Reply action expired for ${action.notificationId}"
+                                "⚠️ Reply action expired"
                             }
                             MainActivity.appendLogStatic(log)
                         }
@@ -419,10 +503,8 @@ class ZeroLinkService : Service() {
             PACKET_TYPE_MEDIA_STATE -> {
                 val state = ZeroLinkProtocol.deserializeMediaState(payload)
                 if (state != null) {
-                    Log.i(TAG, "Media state from PC: ${state.title} — ${state.artist} (playing=${state.isPlaying})")
-                    MainActivity.appendLogStatic(
-                        "🎵 Now playing on PC: ${state.title} — ${state.artist}"
-                    )
+                    Log.i(TAG, "Media state updated from PC (playing=${state.isPlaying})")
+                    MainActivity.appendLogStatic("🎵 Media state updated from PC")
                     MainActivity.updateMediaStateStatic(state)
                     updateMediaNotification(state)
                 }
@@ -436,11 +518,22 @@ class ZeroLinkService : Service() {
                 }
             }
             L2capServer.PACKET_TYPE_WIFI_WAKE -> {
-                Log.i(TAG, "Received Magic Packet: Waking ephemeral Wi-Fi socket")
+                val wake = ZeroLinkProtocol.deserializeWifiWake(payload)
+                if (wake == null || wake.reason != "wake") {
+                    Log.w(TAG, "Ignoring malformed or unsupported Wi-Fi wake payload")
+                    return
+                }
+                Log.i(TAG, "Received authenticated bulk-transfer wake request")
                 MainActivity.appendLogStatic("⚡ Received Wi-Fi Wake Request from Windows")
-                wifiManager.wakeAndListen { localIp, port ->
+                wifiManager.wakeAndListen(wake.port, wake.sessionToken) { localIp, port ->
                     Log.i(TAG, "Ephemeral Wi-Fi server ready on $localIp:$port")
                     MainActivity.appendLogStatic("Ephemeral Wi-Fi listening on $localIp:$port")
+                    val acknowledgement = ZeroLinkProtocol.serializeWifiWake(
+                        WifiWakePayload(localIp, port, wake.sessionToken, "ready")
+                    )
+                    if (!sendPacket(L2capServer.PACKET_TYPE_WIFI_WAKE, acknowledgement)) {
+                        Log.w(TAG, "Could not send bulk-transfer ready acknowledgement")
+                    }
                 }
             }
             else -> {
@@ -460,7 +553,29 @@ class ZeroLinkService : Service() {
         return false
     }
 
+    fun forgetPairedDevice(): Boolean {
+        val connected = (::networkBridge.isInitialized && networkBridge.isConnected) ||
+            (::l2capServer.isInitialized && l2capServer.isConnected)
+        if (connected) {
+            val requested = sendPacket(PACKET_TYPE_SIGNALING, byteArrayOf(0x50, 0x02))
+            if (requested) {
+                MainActivity.appendLogStatic("🔐 Waiting for Windows to acknowledge pairing removal...")
+            }
+            return requested
+        }
+
+        return try {
+            PairingSecretStore(this).clear()
+            MainActivity.appendLogStatic("🔐 Android pairing removed locally. Use Forget Paired Device on Windows too before pairing again.")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not remove paired-device secret", e)
+            false
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        MainActivity.refreshServiceStateStatic()
         return START_STICKY
     }
 
@@ -481,6 +596,7 @@ class ZeroLinkService : Service() {
         wifiManager.teardown()
         serviceScope.cancel()
         instance = null
+        MainActivity.refreshServiceStateStatic()
         super.onDestroy()
     }
 }

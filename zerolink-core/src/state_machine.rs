@@ -109,15 +109,14 @@ impl DualRadioStateMachine {
                 }
             }
 
-            (
-                State::WifiWaking { reason, .. },
-                Event::WifiWakeAcknowledged { target_ip, port },
-            ) => State::WifiActiveTransfer {
-                reason: *reason,
-                target_ip,
-                port,
-                last_chunk_at: now,
-            },
+            (State::WifiWaking { reason, .. }, Event::WifiWakeAcknowledged { target_ip, port }) => {
+                State::WifiActiveTransfer {
+                    reason: *reason,
+                    target_ip,
+                    port,
+                    last_chunk_at: now,
+                }
+            }
 
             (
                 State::WifiActiveTransfer {
@@ -169,17 +168,17 @@ impl DualRadioStateMachine {
     pub fn check_timeouts(&mut self) -> Result<bool> {
         let now = Instant::now();
         match &self.current_state {
-            State::WifiActiveTransfer { last_chunk_at, .. } => {
-                if now.duration_since(*last_chunk_at) > self.wifi_inactivity_timeout {
-                    self.handle_event(Event::WifiTimeout)?;
-                    return Ok(true);
-                }
+            State::WifiActiveTransfer { last_chunk_at, .. }
+                if now.duration_since(*last_chunk_at) > self.wifi_inactivity_timeout =>
+            {
+                self.handle_event(Event::WifiTimeout)?;
+                return Ok(true);
             }
-            State::WifiWaking { requested_at, .. } => {
-                if now.duration_since(*requested_at) > self.wifi_inactivity_timeout {
-                    self.handle_event(Event::WifiTimeout)?;
-                    return Ok(true);
-                }
+            State::WifiWaking { requested_at, .. }
+                if now.duration_since(*requested_at) > self.wifi_inactivity_timeout =>
+            {
+                self.handle_event(Event::WifiTimeout)?;
+                return Ok(true);
             }
             _ => {}
         }

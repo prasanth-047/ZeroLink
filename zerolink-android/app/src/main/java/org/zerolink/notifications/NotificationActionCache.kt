@@ -61,14 +61,14 @@ object NotificationActionCache {
             }
             RemoteInput.addResultsToIntent(cached.remoteInputs, intent, results)
             cached.pendingIntent.send(context, 0, intent)
-            Log.i(TAG, "Delivered inline reply for notification $notificationId")
+            Log.i(TAG, "Delivered inline notification reply")
             true
         } catch (e: PendingIntent.CanceledException) {
-            Log.w(TAG, "Reply PendingIntent was cancelled for $notificationId", e)
+            Log.w(TAG, "Reply PendingIntent was cancelled", e)
             remove(notificationId)
             false
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to deliver inline reply for $notificationId", e)
+            Log.e(TAG, "Failed to deliver inline notification reply", e)
             false
         }
     }

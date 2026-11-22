@@ -162,7 +162,7 @@ table Heartbeat {
     battery_percentage: uint8;
     is_charging: bool;
     wifi_connected: bool;
-    quic_port_active: uint16;
+    bulk_port_active: uint16;
     device_power_mode: uint8; // 0: Normal, 1: LowPower, 2: DozeMode
 }
 

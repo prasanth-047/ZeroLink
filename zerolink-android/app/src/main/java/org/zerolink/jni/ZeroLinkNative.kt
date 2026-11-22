@@ -24,6 +24,10 @@ object ZeroLinkNative {
      * Completes ECDH handshake with the peer public key and salt, initializing AES-256-GCM session cipher.
      */
     external fun completeHandshake(clientPubBytes: ByteArray, saltBytes: ByteArray): Boolean
+    external fun keyConfirmationTag(transcript: ByteArray): ByteArray?
+    external fun pairingCode(clientPubBytes: ByteArray, saltBytes: ByteArray, serverPubBytes: ByteArray): String?
+    external fun pairingSecret(): ByteArray?
+    external fun deriveWifiBulkKeys(sessionToken: ByteArray, serverChallenge: ByteArray): ByteArray?
 
     /**
      * Encrypts and frames plaintext data into a ZeroLink binary wire packet.

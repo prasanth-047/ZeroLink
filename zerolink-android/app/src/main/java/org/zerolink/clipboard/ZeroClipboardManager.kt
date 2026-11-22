@@ -19,6 +19,9 @@ class ZeroClipboardManager(
     companion object {
         private const val TAG = "ZeroLink.Clipboard"
         const val FORMAT_PLAIN_TEXT = 0
+
+        internal fun decodeRemoteClipboard(format: Int, data: ByteArray): String? =
+            if (format == FORMAT_PLAIN_TEXT) String(data, Charsets.UTF_8) else null
     }
 
     private val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -93,7 +96,7 @@ class ZeroClipboardManager(
 
         val sent = packetSender(L2capServer.PACKET_TYPE_CLIPBOARD, buf.array())
         if (sent) {
-            Log.i(TAG, "Local clipboard synced to Windows (hash: ${java.lang.Long.toHexString(hash)}, len: ${textBytes.size})")
+            Log.i(TAG, "Local clipboard synced to Windows")
         }
     }
 
@@ -115,7 +118,7 @@ class ZeroClipboardManager(
 
         val sent = packetSender(L2capServer.PACKET_TYPE_CLIPBOARD, buf.array())
         if (sent) {
-            Log.i(TAG, "Manual clipboard synced to Windows: '$text'")
+            Log.i(TAG, "Manual clipboard synced to Windows")
         }
         return sent
     }
@@ -124,13 +127,17 @@ class ZeroClipboardManager(
      * Injects remote clipboard content received from Windows.
      */
     fun injectRemoteClipboard(format: Int, hash: Long, data: ByteArray) {
+        val text = decodeRemoteClipboard(format, data)
+        if (text == null) {
+            Log.w(TAG, "Ignored unsupported remote clipboard format")
+            return
+        }
         lastRemoteHash.set(hash)
         mainHandler.post {
             try {
-                val text = String(data, Charsets.UTF_8)
                 val clipData = ClipData.newPlainText("ZeroLink Remote", text)
                 clipboard.setPrimaryClip(clipData)
-                Log.i(TAG, "Injected remote clipboard from Windows (hash: ${java.lang.Long.toHexString(hash)})")
+                Log.i(TAG, "Injected remote clipboard from Windows")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to inject remote clipboard", e)
             }

@@ -1,21 +1,29 @@
 package org.zerolink.wifi
 
 import android.content.Context
+import android.content.ContentUris
 import android.net.wifi.WifiManager
+import android.provider.MediaStore
 import android.util.Log
+import org.zerolink.jni.ZeroLinkNative
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileInputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class EphemeralWifiManager(
     private val context: Context,
@@ -25,14 +33,24 @@ class EphemeralWifiManager(
     companion object {
         private const val TAG = "ZeroLink.EphemeralWifi"
         private const val INACTIVITY_TIMEOUT_MS = 30_000L
-        const val DEFAULT_QUIC_PORT = 8443
+        private const val MAX_RANGE_BYTES = 16 * 1024 * 1024
+        private const val SESSION_TOKEN_HEX_LENGTH = 64
+        private const val MAX_FILE_ID_BYTES = 256
+        private const val BULK_CHALLENGE_BYTES = 32
+        private const val GCM_NONCE_BYTES = 12
+        private const val GCM_TAG_BYTES = 16
+        private const val MAX_ENCRYPTED_REQUEST_BYTES = 512
+        const val DEFAULT_BULK_PORT = 8443
     }
 
     private val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+    private val secureRandom = SecureRandom()
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
     private var timeoutJob: Job? = null
     private var wasWifiInitiallyEnabled: Boolean = true
+    @Volatile private var activeSessionToken: String? = null
+    @Volatile private var activePort: Int = DEFAULT_BULK_PORT
 
     @Volatile
     var isServerActive: Boolean = false
@@ -42,9 +60,17 @@ class EphemeralWifiManager(
      * Woken by BLE Magic Packet (WifiWakeRequest).
      * Spins up an ephemeral local high-throughput socket for bulk data.
      */
-    fun wakeAndListen(port: Int = DEFAULT_QUIC_PORT, onReady: (localIp: String, port: Int) -> Unit) {
+    fun wakeAndListen(
+        port: Int = DEFAULT_BULK_PORT,
+        sessionToken: String,
+        onReady: (localIp: String, port: Int) -> Unit
+    ) {
+        require(port in 1..65535)
+        require(decodeSessionToken(sessionToken) != null)
+        activeSessionToken = sessionToken
         if (isServerActive) {
             resetInactivityTimeout()
+            onReady(getLocalIpAddress() ?: "127.0.0.1", activePort)
             return
         }
 
@@ -61,6 +87,7 @@ class EphemeralWifiManager(
                 server.reuseAddress = true
                 server.bind(InetSocketAddress(port))
                 serverSocket = server
+                activePort = port
                 isServerActive = true
 
                 val localIp = getLocalIpAddress() ?: "127.0.0.1"
@@ -84,68 +111,155 @@ class EphemeralWifiManager(
         }
     }
 
-    private fun handleClient(socket: Socket) {
-        scope.launch(Dispatchers.IO) {
+    private suspend fun handleClient(socket: Socket) {
+            var output: DataOutputStream? = null
+            var requestReceived = false
             try {
-                val input = socket.getInputStream()
-                val output = socket.getOutputStream()
+                socket.soTimeout = 10_000
+                val input = DataInputStream(socket.getInputStream())
+                val outputStream = DataOutputStream(socket.getOutputStream())
+                output = outputStream
+                val challenge = ByteArray(BULK_CHALLENGE_BYTES).also(secureRandom::nextBytes)
+                outputStream.write(challenge)
+                outputStream.flush()
 
-                // Read 4-byte command (0x01: fetch file, 0x02: stream finish)
-                val cmdBuf = ByteArray(4)
-                if (input.read(cmdBuf) < 4) return@launch
+                val token = activeSessionToken?.let(::decodeSessionToken)
+                    ?: throw IOException("No active transfer token")
+                val keys = ZeroLinkNative.deriveWifiBulkKeys(token, challenge)
+                    ?: throw IOException("Could not derive transfer keys")
 
-                val cmd = ByteBuffer.wrap(cmdBuf).order(ByteOrder.BIG_ENDIAN).int
-                if (cmd == 1) {
-                    // File fetch request: 2-byte path len + path + 8-byte offset + 4-byte len
-                    val pathLenBuf = ByteArray(2)
-                    input.read(pathLenBuf)
-                    val pathLen = ByteBuffer.wrap(pathLenBuf).order(ByteOrder.BIG_ENDIAN).short.toInt() and 0xFFFF
-                    val pathBytes = ByteArray(pathLen)
-                    input.read(pathBytes)
-                    val relativePath = String(pathBytes, Charsets.UTF_8)
-
-                    val numBuf = ByteArray(12)
-                    input.read(numBuf)
-                    val offset = ByteBuffer.wrap(numBuf, 0, 8).order(ByteOrder.BIG_ENDIAN).long
-                    val length = ByteBuffer.wrap(numBuf, 8, 4).order(ByteOrder.BIG_ENDIAN).int
-
-                    streamFileChunk(relativePath, offset, length, output)
+                val requestNonce = ByteArray(GCM_NONCE_BYTES)
+                input.readFully(requestNonce)
+                val encryptedRequestLength = input.readInt()
+                if (encryptedRequestLength !in (GCM_TAG_BYTES + 1)..MAX_ENCRYPTED_REQUEST_BYTES) {
+                    throw IOException("Invalid encrypted request length")
                 }
+                val encryptedRequest = ByteArray(encryptedRequestLength)
+                input.readFully(encryptedRequest)
+                requestReceived = true
+
+                val requestBody = cryptAesGcm(
+                    Cipher.DECRYPT_MODE,
+                    keys.copyOfRange(0, 32),
+                    requestNonce,
+                    requestAad(challenge),
+                    encryptedRequest
+                )
+                val request = parseRangeRequest(requestBody)
+                val (fileSize, bytes) = readMediaRange(request.fileId, request.offset, request.length)
+                val responseBody = ByteBuffer.allocate(12 + bytes.size)
+                    .order(ByteOrder.BIG_ENDIAN)
+                    .putLong(fileSize)
+                    .putInt(bytes.size)
+                    .put(bytes)
+                    .array()
+                val responseNonce = ByteArray(GCM_NONCE_BYTES).also(secureRandom::nextBytes)
+                val encryptedResponse = cryptAesGcm(
+                    Cipher.ENCRYPT_MODE,
+                    keys.copyOfRange(32, 64),
+                    responseNonce,
+                    responseAad(challenge, requestBody),
+                    responseBody
+                )
+                outputStream.writeInt(0)
+                outputStream.write(responseNonce)
+                outputStream.writeInt(encryptedResponse.size)
+                outputStream.write(encryptedResponse)
+                outputStream.flush()
+                resetInactivityTimeout()
             } catch (e: Exception) {
-                Log.e(TAG, "Error handling ephemeral client transfer", e)
+                Log.w(TAG, "Rejected ephemeral transfer request: ${e.message}")
+                if (requestReceived) {
+                    try {
+                        output?.writeInt(-1)
+                        output?.flush()
+                    } catch (_: Exception) {}
+                }
             } finally {
                 try { socket.close() } catch (_: Exception) {}
                 resetInactivityTimeout()
             }
-        }
     }
 
-    private fun streamFileChunk(path: String, offset: Long, length: Int, output: java.io.OutputStream) {
-        val file = File(context.filesDir, path)
-        if (!file.exists()) {
-            output.write(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(-1).array())
-            output.flush()
-            return
+    private data class MediaRangeRequest(
+        val fileId: String,
+        val offset: Long,
+        val length: Int
+    )
+
+    private fun parseRangeRequest(body: ByteArray): MediaRangeRequest {
+        val buffer = ByteBuffer.wrap(body).order(ByteOrder.BIG_ENDIAN)
+        if (buffer.remaining() < 15 || buffer.get().toInt() != 1) {
+            throw IOException("Unsupported media range request")
         }
+        val idLength = buffer.short.toInt() and 0xffff
+        if (idLength !in 1..MAX_FILE_ID_BYTES || buffer.remaining() != idLength + 12) {
+            throw IOException("Invalid media id length")
+        }
+        val idBytes = ByteArray(idLength)
+        buffer.get(idBytes)
+        val fileId = idBytes.toString(Charsets.UTF_8)
+        val offset = buffer.long
+        val length = buffer.int
+        if (buffer.hasRemaining() || offset < 0 || length !in 1..MAX_RANGE_BYTES) {
+            throw IOException("Invalid file range")
+        }
+        return MediaRangeRequest(fileId, offset, length)
+    }
 
-        val actualLen = if (length > 0) length else file.length().toInt()
-        val header = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(file.length()).array()
-        output.write(header)
+    private fun decodeSessionToken(token: String): ByteArray? {
+        if (token.length != SESSION_TOKEN_HEX_LENGTH) return null
+        val bytes = ByteArray(32)
+        for (index in bytes.indices) {
+            val high = token[index * 2].digitToIntOrNull(16) ?: return null
+            val low = token[index * 2 + 1].digitToIntOrNull(16) ?: return null
+            bytes[index] = ((high shl 4) or low).toByte()
+        }
+        return bytes
+    }
 
-        FileInputStream(file).use { fis ->
-            fis.skip(offset)
-            val buffer = ByteArray(64 * 1024)
-            var remaining = actualLen
-            while (remaining > 0) {
-                val toRead = minOf(buffer.size, remaining)
-                val read = fis.read(buffer, 0, toRead)
-                if (read <= 0) break
-                output.write(buffer, 0, read)
-                remaining -= read
+    private fun cryptAesGcm(mode: Int, key: ByteArray, nonce: ByteArray, aad: ByteArray, data: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(mode, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(aad)
+        return cipher.doFinal(data)
+    }
+
+    private fun requestAad(challenge: ByteArray): ByteArray =
+        "ZeroLink-v1-wifi-bulk-request".toByteArray(Charsets.UTF_8) + challenge
+
+    private fun responseAad(challenge: ByteArray, requestBody: ByteArray): ByteArray =
+        "ZeroLink-v1-wifi-bulk-response".toByteArray(Charsets.UTF_8) + challenge + requestBody
+
+    private fun readMediaRange(fileId: String, offset: Long, length: Int): Pair<Long, ByteArray> {
+        val mediaId = fileId.toLongOrNull() ?: throw IOException("Invalid media id")
+        val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, mediaId)
+        val descriptor = context.contentResolver.openFileDescriptor(uri, "r")
+            ?: throw IOException("Media item is unavailable")
+        val input = android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor)
+        input.use { stream ->
+            val fileSize = descriptor.statSize
+            if (fileSize < 0 || offset > fileSize) throw IOException("Invalid media range")
+            val actualLength = minOf(length.toLong(), fileSize - offset).toInt()
+            var skipped = 0L
+            while (skipped < offset) {
+                val step = stream.skip(offset - skipped)
+                if (step > 0) {
+                    skipped += step
+                } else {
+                    if (stream.read() < 0) throw IOException("Could not seek to media range")
+                    skipped++
+                }
             }
-            output.flush()
+            val bytes = ByteArray(actualLength)
+            var readTotal = 0
+            while (readTotal < actualLength) {
+                val count = stream.read(bytes, readTotal, actualLength - readTotal)
+                if (count < 0) throw IOException("Media item ended before requested range")
+                readTotal += count
+            }
+            return fileSize to bytes
         }
-        Log.i(TAG, "Transferred $actualLen bytes for file: $path")
     }
 
     private fun resetInactivityTimeout() {
@@ -164,6 +278,7 @@ class EphemeralWifiManager(
             serverSocket?.close()
         } catch (_: Exception) {}
         serverSocket = null
+        activeSessionToken = null
 
         // If Wi-Fi was initially off before waking, turn it back off to strictly preserve battery
         if (!wasWifiInitiallyEnabled && wifiManager.isWifiEnabled) {
